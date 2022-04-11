@@ -1,0 +1,73 @@
+Program: train.py
+method: random
+project: xl_gnn
+entity: seanco
+parameters:
+  num_classes:
+    values: [2, 3, 4, 5, 7, 9, 10]
+  dropout:
+    value: 0.0
+  output_size:
+    value: 3
+  distance_th_classification:
+    value: none
+  hidden_layers:
+    value: 3
+  layers:
+    values: [32, 64, 128]
+  type:
+    value: gnn
+  sample:
+    value: true
+  pool_ratio:
+    values: [0, 0.4, 0.6, 0.8]
+  pool_policy:
+    value: all
+  cb_pred:
+    values: [true, false]
+  omega_pred:
+    values: [true, false]
+  theta_pred:
+    values: [true, false]
+  phi_pred:
+    values: [true, false]
+  loss_head_weights:
+    values: [[1, 0.5, 0.25, 0.25, 0.25], [1, 0.1, 0.1, 0.1, 0.1], [1, 0.1, 0.25, 0.25, 0.25]]
+  debug:
+    value: false
+  data_type:
+    value: train
+  similarity_clear:
+    value: 0.05
+  dataset:
+    value: separate_graphs_39f_12t_dataset
+  node_feat:
+    value: 39
+  is_connected:
+    value: false
+  base_lr:
+    values: [0.001, 0.0005, 0.0001]
+  momentum:
+    value: 0.9
+  weight_decay:
+    values: [0.0, 1e-5, 1e-6, 1e-7]
+  optimizing_method:
+    value: adam
+  scheduler:
+    value: none
+  steps:
+    value: none
+  gamma:
+    value: 0.2
+  batch_size:
+    values: [32, 48, 54 ]
+  epochs:
+    value: 50
+  hparam_method:
+    value: sweeps
+  hparam_tune:
+    value: false
+  loss_type:
+    value: bce
+  weight:
+    values: [true, false]

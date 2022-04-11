@@ -1,0 +1,29 @@
+MODEL:
+  DROPOUT: 0.5
+  INPUT_SIZE: 128
+  OUTPUT_SIZE: 1
+  NUM_CLASSES: 2
+  DISTANCE_TH_CLASSIFICATION: 18
+  HIDDEN_LAYERS: 0
+DATA:
+  FEATURES_PATH: best_dsso_feat_trainset
+  LABELS: best_dsso_label_trainset
+  DISTANCES: best_dsso_dist_trainset
+  TYPE: TRAIN
+SOLVER:
+  BASE_LR: 0.005
+  MOMENTUM: 0.9
+  WEIGHT_DECAY: 0.000
+  OPTIMIZING_METHOD: adam
+  SCHEDULER: steps
+  STEPS: [20, 35, 45]
+  GAMMA: 0.2
+TRAIN:
+  BATCH_SIZE: 32
+  EPOCHS: 50
+  EVAL_PERIOD: 1
+  HPARAM_TUNE: True
+LOSS:
+  TYPE: bce
+  WEIGHT: True
+NAME: dsso_only

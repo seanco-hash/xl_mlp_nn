@@ -1,0 +1,48 @@
+MODEL:
+  DROPOUT: 0.4
+  INPUT_SIZE: 363
+  OUTPUT_SIZE: 1
+  NUM_CLASSES: 2
+  DISTANCE_TH_CLASSIFICATION: None
+  HIDDEN_LAYERS: 1
+  LAYERS: [256, 128, 32]
+  BATCHNORM: True
+  TYPE: resmlp
+DATA:
+  FEATURES: processed_features_trainset
+  LABELS: processed_labels_trainset
+  DISTANCES: processed_dist_trainset
+  TYPE: TRAIN
+  TRANSFORM: flip
+  MEAN: 0.21694291786377354
+  STD: 0.49163950469350526
+  FILTER: lysine
+  SIMILARITY_CLEAR: 0.05
+  DATASET: regular
+TEST:
+  FEATURES: processed_features_testset
+  LABELS: processed_labels_testset
+  DISTANCES: dist_testset
+SOLVER:
+  BASE_LR: 0.0001
+  MOMENTUM: 0.9
+  WEIGHT_DECAY: 0.00001
+  OPTIMIZING_METHOD: adam
+  SCHEDULER: steps
+  STEPS: None
+  GAMMA: 0.2
+TRAIN:
+  BATCH_SIZE: 128
+  EPOCHS: 50
+  EVAL_PERIOD: 1
+  HPARAM_METHOD: None
+  HPARAM_TUNE: False
+LOSS:
+  TYPE: bce
+  WEIGHT: True
+NAME: all_processed_objects
+RAW_DATA:
+  FEATURES_LIST: processed_features
+  KEYS_LIST: processed_keys
+  DIST_LIST: processed_dist
+  LABEL_LIST: processed_labels
