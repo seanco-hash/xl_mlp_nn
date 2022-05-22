@@ -255,7 +255,6 @@ def eval_epoch(model, val_loader, criterion, epoch, val_loss, wandb_, is_regress
     is_cb = cfg['cb_pred']
     loss_weights = None
     losses = None
-    per_class_acc = [0, 0]
     if is_connected is False:
         losses = torch.zeros(5, device=device)
         loss_weights = cfg['loss_head_weights']

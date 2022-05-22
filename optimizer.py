@@ -3,16 +3,16 @@ import torch
 
 
 def construct_optimizer(optim_params, cfg):
-    lr = cfg['SOLVER']['BASE_LR']
-    wd = cfg['SOLVER']['WEIGHT_DECAY']
-    if cfg['SOLVER']['OPTIMIZING_METHOD'] == "sgd":
+    lr = cfg['base_lr']
+    wd = cfg['weight_decay']
+    if cfg['optimizing_method'] == "sgd":
         return torch.optim.SGD(
             optim_params,
             lr=lr,
-            momentum=cfg['SOLVER']['MOMENTUM'],
+            momentum=cfg['momentum'],
             weight_decay=wd,
         )
-    elif cfg['SOLVER']['OPTIMIZING_METHOD'] == "adam":
+    elif cfg['optimizing_method'] == "adam":
         return torch.optim.Adam(
             optim_params,
             lr=lr,
@@ -22,7 +22,7 @@ def construct_optimizer(optim_params, cfg):
         )
     else:
         raise NotImplementedError(
-            "Does not support {} optimizer".format(cfg['SOLVER']['OPTIMIZING_METHOD'])
+            "Does not support {} optimizer".format(cfg['optimizing_method'])
         )
 
 

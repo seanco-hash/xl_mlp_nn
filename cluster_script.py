@@ -7,7 +7,7 @@ WORKDIR = "/cs/labs/dina/seanco/xl_mlp_nn/"
 out_dir = WORKDIR + 'scripts/'
 
 ask_time = "2-0"
-mem = "32000M"
+mem = "48G"
 cpus = "4"
 gpus = "1"
 gpu_mem = "10g"
@@ -18,10 +18,16 @@ INTRO = "#!/bin/tcsh \n" \
       "cd /cs/labs/dina/seanco/xl_mlp_nn/\n"
 PYTHON = "python3 "
 TRAIN = 'train.py'
+TRAIN2 = 'train2.py'
+SWEEPS = '/cs/labs/dina/seanco/xl_parser/xl_db_parser_venv/bin/wandb agent seanco/xl_gnn/k4v2onan'
+
 DATASET_RUN = 'graph_dataset.py'
 
 INLINE_INTRO = "--mem=" + mem + " -c" + cpus + " --time=" + ask_time + " --gres=gpu:" + gpus + "," \
-               "vmem:" + gpu_mem + " --killable "
+               "vmem:" + gpu_mem + " --killable --requeue "
+
+# INLINE_INTRO = "--mem=" + mem + " -c" + cpus + " --time=" + ask_time + " --partition=puffin --gres=gpu:a30 "
+# INLINE_INTRO = "--mem=" + mem + " -c" + cpus + " --time=" + ask_time + " --gres=gpu:a100-1-10 "
 
 INLINE_INTRO_CPU = "--mem=" + mem + " -c" + cpus + " --time=" + ask_time + " "
 
@@ -50,6 +56,20 @@ def train_gpu_script():
     subprocess.run("sbatch " + INLINE_INTRO + WORKDIR + "scripts/train.sh", shell=True)
 
 
+def run_sweeps_script():
+    with open(WORKDIR + 'scripts/sweeps.sh', 'w') as script:
+        script.write("#!/bin/tcsh\n")
+        script.write("cd /cs/labs/dina/seanco/xl_mlp_nn/\n")
+        script.write("source /cs/labs/dina/seanco/xl_parser/xl_db_parser_venv/bin/activate.csh\n")
+        script.write("module load cuda/11.3\n")
+        script.write("module load cudnn/8.2.1\n")
+        # script.write("module load cudnn/7.6.2\n")
+        script.write(SWEEPS)
+        script.write("\n")
+        script.close()
+    subprocess.run("sbatch " + INLINE_INTRO + WORKDIR + "scripts/train.sh", shell=True)
+
+
 def graph_dataset_script():
     with open(WORKDIR + 'scripts/dataset.sh', 'w') as script:
         script.write("#!/bin/tcsh\n")
@@ -65,6 +85,7 @@ def graph_dataset_script():
 
 def main():
     train_gpu_script()
+    # run_sweeps_script()
 
 
 if __name__ == "__main__":

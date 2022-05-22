@@ -2,7 +2,7 @@ import multiprocessing
 from os import listdir
 
 import os
-
+import random
 import numpy as np
 import torch
 from torch_geometric.data import Data, Dataset, InMemoryDataset
@@ -11,6 +11,7 @@ from torch_geometric.utils import add_self_loops
 import sys
 import data_proccess
 from torch_geometric.loader import DataLoader as PyG_DataLoader
+from torch_geometric.transforms import BaseTransform
 sys.path.insert(0, '/cs/labs/dina/seanco/xl_parser')
 import cross_link
 import general_utils
@@ -27,16 +28,40 @@ AA_DICT = {0: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 6, 8: 7, 10: 8, 11: 9, 12: 10,
 Y_DISTANCES = 0
 Y_OMEGA = 1
 OMEGA_SIZE = 2
+OMEGA_BINS = 24
 Y_THETA = 2
 THETA_SIZE = 4
+THETA_BINS = 24
 Y_PHI = 3
 PHI_SIZE = 4
+PHI_BINS = 12
 CA_DIST = 0
 CB_DIST = 1
 COS = 0
 SIN = 1
 INTRA_XL = torch.from_numpy(np.asarray([0, 1])).long
 INTER_XL = torch.from_numpy(np.asarray([1, 0])).long
+
+
+class FlipTransform(BaseTransform):
+    def __init__(self, p=0.5):
+        self.p = p
+
+    def __call__(self, data):
+        if random.random() < self.p:
+            data.x_a, data.x_b = data.x_b, data.x_a
+            data.edge_attr_a, data.edge_attr_b = data.edge_attr_b, data.edge_attr_a
+            data.edge_index_a, data.edge_index_b = data.edge_index_b, data.edge_index_a
+            tmp = data.y_theta[:2].clone()
+            data.y_theta[:2] = data.y_theta[2:4]
+            data.y_theta[2:4] = tmp
+            tmp = data.y_phi[:2].clone()
+            data.y_phi[:2] = data.y_phi[2:4]
+            data.y_phi[2:4] = tmp
+        return data
+
+    def __repr__(self) -> str:
+        return f'{self.__class__.__name__}(p={self.p})'
 
 
 class TwoGraphsData(Data):
@@ -323,13 +348,13 @@ def parallel_generate_graph_data():
 
 
 class XlGraphDataset(InMemoryDataset):
-    def __init__(self, cfg, is_train=True, root=ROOT_DATA_DIR, transform=None, pre_transform=None, pre_filter=None):
-        self.dataset_name = cfg['DATA']['DATASET']
+    def __init__(self, cfg, th, root=ROOT_DATA_DIR, transform=None, pre_transform=None, pre_filter=None):
+        self.dataset_name = cfg['dataset']
         super().__init__(root, transform, pre_transform, pre_filter)
         self.data, self.slices = torch.load(self.processed_paths[0])
-        self.get_labels(cfg)
+        self.get_labels(cfg, th)
         self.min_max_scaling_normalization()
-        self._num_classes = cfg['MODEL']['NUM_CLASSES']
+        self._num_classes = cfg['num_classes']
 
     @property
     def raw_file_names(self):
@@ -343,10 +368,9 @@ class XlGraphDataset(InMemoryDataset):
     def num_classes(self):
         return self._num_classes
 
-    def get_labels(self, cfg):
+    def get_labels(self, cfg, th):
         self.data.y = torch.from_numpy(data_proccess.FeatDataset.get_labels_from_dist(np.asarray(self.data.y),
-                                                                        cfg['MODEL']['NUM_CLASSES'],
-                                                                        cfg['MODEL']['DISTANCE_TH_CLASSIFICATION']))
+                                                                        cfg['num_classes'], th))
 
     def min_max_scaling_normalization(self):
         max_c = torch.max(self.data.x, dim=0).values
@@ -418,8 +442,9 @@ class XlGraphDataset(InMemoryDataset):
 
 
 class XlPairGraphDataset(XlGraphDataset):
-    def __init__(self, cfg, is_train=True, root=ROOT_DATA_DIR, transform=None, pre_transform=None, pre_filter=None):
-        super().__init__(cfg, is_train, root, transform, pre_transform, pre_filter)
+    def __init__(self, cfg, th, root=ROOT_DATA_DIR, transform=None, pre_transform=None, pre_filter=None):
+        super().__init__(cfg, th, root, transform, pre_transform, pre_filter)
+        self.data.linker_size = torch.reshape(self.data.linker_size, (self.data.linker_size.size()[0], 1))
 
     @property
     def raw_file_names(self):
@@ -435,21 +460,45 @@ class XlPairGraphDataset(XlGraphDataset):
     def get_y(self, data):
         return [data.y_ca, data.y_cb, data.y_omega, data.y_theta, data.y_phi]
 
-    def get_labels(self, cfg):
+    def get_angles_labels(self):
+        omega = torch.reshape(self.data.y_omega, (self.data.y_omega.shape[0] // 2, 2))
+        theta = torch.reshape(self.data.y_theta, (self.data.y_theta.shape[0] // 4, 4))
+        phi = torch.reshape(self.data.y_phi, (self.data.y_phi.shape[0] // 4, 4))
+        omega_a = torch.rad2deg_(torch.atan2(omega[:, 1], omega[:, 0])) + 180
+        omega_a = torch.reshape(torch.remainder(omega_a, OMEGA_BINS).int(), (omega_a.shape[0], 1))
+
+        phi_a = torch.rad2deg_(torch.atan2(phi[:, 1], phi[:, 0]))
+        phi_a = torch.reshape(torch.remainder(phi_a, PHI_BINS).int(), (phi_a.shape[0], 1))
+        phi_b = torch.rad2deg_(torch.atan2(phi[:, 3], phi[:, 2]))
+        phi_b = torch.reshape(torch.remainder(phi_b, PHI_BINS).int(), (phi_b.shape[0], 1))
+
+        theta_a = torch.rad2deg_(torch.atan2(theta[:, 1], theta[:, 0])) + 180
+        theta_a = torch.reshape(torch.remainder(theta_a, THETA_BINS).int(), (theta_a.shape[0], 1))
+        theta_b = torch.rad2deg_(torch.atan2(theta[:, 3], theta[:, 2])) + 180
+        theta_b = torch.reshape(torch.remainder(theta_b, THETA_BINS).int(), (theta_b.shape[0], 1))
+
+        self.data.y_phi = torch.reshape(torch.cat((phi_a, phi_a, phi_b, phi_b), dim=1), self.data.y_phi.shape)
+        self.data.y_theta = torch.reshape(torch.cat((theta_a, theta_a, theta_b, theta_b), dim=1),
+                                          self.data.y_theta.shape)
+        self.data.y_omega = torch.reshape(torch.cat((omega_a, omega_a), dim=1),
+                                          self.data.y_omega.shape)
+
+    def get_labels(self, cfg, th):
         self.data.y_ca = torch.from_numpy(
             data_proccess.FeatDataset.get_labels_from_dist(np.asarray(self.data.y_ca),
-                                                                cfg['MODEL']['NUM_CLASSES'],
-                                                                cfg['MODEL']['DISTANCE_TH_CLASSIFICATION']))
+                                                                cfg['num_classes'], th))
         self.data.y_cb = torch.from_numpy(
             data_proccess.FeatDataset.get_labels_from_dist(np.asarray(self.data.y_cb),
-                                                                cfg['MODEL']['NUM_CLASSES'],
-                                                                cfg['MODEL']['DISTANCE_TH_CLASSIFICATION']))
-        if cfg['MODEL']['NUM_CLASSES'] <= 2:
+                                                                cfg['num_classes'], th))
+        if cfg['num_classes'] <= 2:
             self.data.y_ca = torch.reshape(self.data.y_ca, (self.data.y_ca.shape[0], 1)).float()
             self.data.y_cb = torch.reshape(self.data.y_cb, (self.data.y_cb.shape[0], 1)).float()
         else:
             self.data.y_ca = self.data.y_ca.long()
             self.data.y_cb = self.data.y_cb.long()
+
+        if cfg['angles'] == 'bins':
+            self.get_angles_labels()
 
     def min_max_scaling_normalization(self):
         x = torch.cat((self.data.x_a, self.data.x_b), dim=0)
@@ -488,8 +537,9 @@ class XlPairGraphDataset(XlGraphDataset):
             weights_b[int(label_b)] += 1
         return weights_a, weights_b
 
-
-# data_list = general_utils.load_obj(CONNECTED_GRAPH_4F_DATASET, ROOT_DATA_DIR)
+#
+# data_list = general_utils.load_obj(SEPARATE_39F_ANGLES_DATASET, ROOT_DATA_DIR)
+# x = 7
 # data_list = XlGraphDataset.clear_duplicates(data_list)
 # generate_graph_data()
 # parallel_generate_graph_data()

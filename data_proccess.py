@@ -165,6 +165,17 @@ def create_test_set(cfg):
 
 
 class FeatDataset(Dataset):
+
+    @staticmethod
+    def get_labels_by_thresholds(dist, thresholds):
+        dist[np.logical_and(0 <= dist, dist < thresholds[0])] = 0
+        cat = 1
+        for i in range(1, len(thresholds)):
+            dist[np.logical_and(thresholds[i-1] <= dist, dist < thresholds[i])] = cat
+            cat += 1
+        dist[thresholds[-1] <= dist] = cat
+        return dist
+
     @staticmethod
     def get_labels_from_dist(dist, n_classes, th=None):
         if th is None or th == 'None' or len(th) < n_classes - 1:
@@ -173,13 +184,7 @@ class FeatDataset(Dataset):
             percentiles = np.percentile(dist, perc_arr)
         else:
             percentiles = th
-        dist[np.logical_and(0 <= dist, dist < percentiles[0])] = 0
-        cat = 1
-        for i in range(1, len(percentiles)):
-            dist[np.logical_and(percentiles[i-1] <= dist, dist < percentiles[i])] = cat
-            cat += 1
-        dist[percentiles[-1] <= dist] = cat
-        return dist
+        return FeatDataset.get_labels_by_thresholds(dist, percentiles)
 
     @staticmethod
     def delete_similar_features(features, labels, clear_th=0.05):
