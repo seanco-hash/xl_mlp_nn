@@ -6,15 +6,15 @@ parameters:
   num_classes:
     value: 4
   dropout:
-    values: [0.0, 0.5]
+    values: [0, 0.3]
   output_size:
     value: 4
   distance_th_classification:
     value: None
   hidden_layers:
-    values: [3, 4]
+    value: 3
   layers:
-    values: [256, 512]
+    value: 512
   model_type:
     value: gnn
   sample:
@@ -42,9 +42,9 @@ parameters:
   similarity_clear:
     value: 0.05
   dataset:
-    values: [39f_5A_dataset, separate_graphs_39f_12t_dataset]
+    value: 44f_3A_inter_and_intra_dataset
   node_feat:
-    value: 39
+    value: 44
   is_connected:
     value: False
   base_lr:
@@ -52,9 +52,9 @@ parameters:
   momentum:
     value: 0.9
   weight_decay:
-    value: 0
+    value: 0.0001
   optimizing_method:
-    value: adam
+    value: adamw
   scheduler:
     value: None
   steps:
@@ -84,7 +84,7 @@ parameters:
   multi_gpu:
     value: False
   calibrate_model:
-    value: start
+    value: None
   gnn_type:
     value: gat
   activation:
@@ -92,4 +92,16 @@ parameters:
   batchnorm:
     values: [False, True]
   attention_heads:
-    values: [4, 6, 16]
+    value: 6
+  features:
+    value: {mol2, charge, asa, radius, res_type, anchor, id}
+  spacer_feture:
+    value: True
+  xl_type_feature:
+    value: True
+  global_pool_func:
+    value: sum
+  is_ca_pool:
+    values: [False, True]
+  attn_dropout:
+    value: 0.3
