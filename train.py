@@ -5,25 +5,35 @@ import matplotlib
 import torch
 import os
 import gc
+
+import torch_geometric
 import yaml
-from tqdm import tqdm
 import mlp
 from optimizer import construct_optimizer
 import data_proccess
 from torch.utils.data import random_split
+from torch.utils.data import WeightedRandomSampler
 from torch.utils.data.dataloader import DataLoader
 from torch.optim.lr_scheduler import MultiStepLR
+import torch.nn.functional as F
 from sklearn import metrics
 import random
 from torch_geometric.loader import DataLoader as PyG_DataLoader
+from torch_geometric.loader import DataListLoader as PyG_ListLoader
 import graph_dataset
 from graph_dataset import TwoGraphsData
+import xl_transforms
 import gnn
 import wandb
+import temperature_scaling
+import sys
+sys.path.insert(0, '/cs/labs/dina/seanco/xl_parser')
+import general_utils
+import cross_link
 
 
 torch.multiprocessing.set_sharing_strategy('file_system')
-matplotlib.use('Agg')
+# matplotlib.use('Agg')
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(device)
@@ -31,38 +41,35 @@ print(device)
 
 
 def seed_everything(seed=3407):
-    # random.seed(seed)
+    random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
     if device != "cpu":
-      torch.backends.cudnn.deterministic = True
-      torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
-def ray_load_config():
-    with open('/cs/labs/dina/seanco/xl_mlp_nn/configs/processed_xl.yaml', 'r') as f:
-        cfg = yaml.safe_load(f)
-    return cfg
+def plot_cm(y_true, y_pred_prob):
+    y_pred_tags = np.argmax(y_pred_prob, axis=1).astype(np.int32)
+    th = ['0 - 12', '12 - 20', '20 - 28', '28 - 45']
+    general_utils.plot_confusion_matrix(y_true.tolist(), y_pred_tags, th, title="Confusion Matrix (Validation Set)")
+    general_utils.plot_confusion_matrix(y_true.tolist(), y_pred_tags, th, normalize=True,
+                                        title="Normalized Confusion Matrix (Validation Set)")
+    plt.show()
 
 
-def load_config(args=None):
+def load_config(args=None, cfg_path='/cs/labs/dina/seanco/xl_mlp_nn/configs/gnn_separate_39f_angles.yaml'):
    # Setup cfg.
     if args is None:
-        cfg_file = '/cs/labs/dina/seanco/xl_mlp_nn/configs/gnn_separate_39f_angles.yaml'
+        cfg_file = cfg_path
     else:
         cfg_file = args.cfg_file
     # with open(args.cfg_file, "r") as f:
     with open(cfg_file, "r") as f:
         cfg = yaml.safe_load(f)
 
-    # cfg.set_new_allowed(True)  # Allow new attributes
-        if args is not None:
-            if args.lr is not None:
-                cfg['base_lr'] = args.lr
-
-            if args.epochs is not None:
-                cfg['epochs'] = args.epochs
         return cfg
 
 
@@ -124,6 +131,74 @@ def calc_precision_recall_roc(confusion_matrix, n_classes, pred_prob, true_y, cf
     return auc, recall, precision
 
 
+def loss_corn(logits, y_train):
+    num_classes = logits.shape[1] + 1
+    sets = []
+    for i in range(num_classes-1):
+        label_mask = y_train > i-1
+        label_tensor = (y_train[label_mask] > i).to(torch.int64)
+        sets.append((label_mask, label_tensor))
+
+    num_examples = 0
+    losses = 0.
+    for task_index, s in enumerate(sets):
+        train_examples = s[0]
+        train_labels = s[1]
+
+        if len(train_labels) < 1:
+            continue
+
+        num_examples += len(train_labels)
+        pred = logits[train_examples, task_index]
+
+        loss = -torch.sum(F.logsigmoid(pred)*train_labels + (F.logsigmoid(pred) - pred)*(1-train_labels))
+        losses += loss
+    return losses/num_examples
+
+
+def label_from_corn_logits(logits):
+    """ Converts logits to class labels.
+    This is function is specific to CORN.
+    """
+    probas = torch.sigmoid(logits)
+    probas = torch.cumprod(probas, dim=1)
+    predict_levels = probas > 0.5
+    predicted_labels = torch.sum(predict_levels, dim=1)
+    return predicted_labels
+
+
+def prediction2label(pred):
+    """Convert ordinal predictions to class labels, e.g.
+    [0.9, 0.1, 0.1, 0.1] -> 0
+    [0.9, 0.9, 0.1, 0.1] -> 1
+    [0.9, 0.9, 0.9, 0.1] -> 2
+    etc.
+    """
+    pred = torch.round(pred)
+    pred = (pred > 0.5).cumprod(axis=1).sum(axis=1) - 1
+    pred[pred < 0] += 1
+    return pred
+
+
+def ordinal_regression(predictions, targets):
+    """Ordinal regression with encoding as in https://arxiv.org/pdf/0704.1028.pdf"""
+    # Create out modified target with [batch_size, num_labels] shape
+    modified_target = torch.zeros_like(predictions)
+    predictions = torch.round(predictions)
+    modified_pred = torch.zeros_like(predictions)
+    for i in range(1, predictions.shape[1]):
+        modified_pred[:, i] = predictions[:, i-1] * predictions[:, i]
+    # predictions = (predictions > 0.5).cumprod(axis=1)
+
+    # Fill in ordinal target function, i.e. 0 -> [1,0,0,...]
+    for i, target in enumerate(targets):
+        modified_target[i, 0:target+1] = 1
+
+    # return torch.nn.MSELoss(reduction='none')(predictions, modified_target).sum(axis=1)
+    return torch.mean(torch.nn.MSELoss(reduction='none')(modified_pred, modified_target).sum(axis=1))
+    # return criterion(predictions, modified_target)
+
+
 def record_angles_accuracy(outputs, labels, wandb_, epoch, cfg):
     omega_acc, theta_acc, phi_acc = None, None, None
     if cfg['omega_pred']:
@@ -154,13 +229,21 @@ def record_angles_accuracy(outputs, labels, wandb_, epoch, cfg):
             wandb_.log({'epoch': epoch, f"{title_lst[i]} Angle Accuracy / Train": acc[i]})
 
 
-def calc_accuracy(output, labels, confusion_matrix=None, n_classes=2, distances=None):
-    if n_classes > 2:
+def calc_accuracy(output, labels, confusion_matrix=None, n_classes=2, distances=None, loss_type='bce', temp_s=False):
+    if loss_type == 'ordinal':
+        y_pred_tags = prediction2label(output)
+        y_pred_prob = output
+    elif loss_type == 'corn':
+        y_pred_tags = label_from_corn_logits(output)
+        y_pred_prob = output
+    elif n_classes > 2:
         y_pred_prob = torch.softmax(output, dim=1)
         _, y_pred_tags = torch.max(y_pred_prob, dim=1)
     else:
         y_pred_prob = torch.sigmoid(output)
         y_pred_tags = torch.round(y_pred_prob)
+    if temp_s:
+        y_pred_prob = output
     correct_pred = (y_pred_tags == labels).float()
     # if distances is not None:
     #     distances = distances[~correct_pred.bool().flatten()]
@@ -195,7 +278,7 @@ def calculate_loss_multi_head_bins(data, model, criterion, loss_weights, losses)
     return cur_total_loss, inputs, outputs, labels
 
 
-def calculate_loss_multi_head(data, model, criterion, loss_weights, losses):
+def calculate_loss_multi_head(data, model, criterion, loss_weights, losses, is_sample_weights=False, is_eval=False):
     inputs = data.to(device, non_blocking=True)
     outputs = model(inputs)
     labels = [inputs.y_ca, inputs.y_cb, inputs.y_omega, inputs.y_theta, inputs.y_phi]
@@ -207,17 +290,24 @@ def calculate_loss_multi_head(data, model, criterion, loss_weights, losses):
     for k in range(len(criterion)):
         if criterion[k] is not None:
             tmp_loss = criterion[k](outputs[k], labels[k])
+            if k == 0 and is_sample_weights:
+                if not is_eval:
+                    # tmp_loss = (tmp_loss * inputs.ca_error).mean()
+                    tmp_loss = (tmp_loss * ((10 * inputs.xl_type[:, 1]) + 1)).mean()
+                else:
+                    tmp_loss = tmp_loss.mean()
             losses[k] += tmp_loss
             tmp_loss = loss_weights[k] * tmp_loss
             cur_total_loss += tmp_loss
     return cur_total_loss, inputs, outputs, labels
 
 
-def calculate_loss(is_gnn, data, model, criterion, n_classes, loss_weights, cfg, is_connected=True, losses=None):
+def calculate_loss(is_gnn, data, model, criterion, n_classes, loss_weights, cfg, is_connected=True, losses=None,
+                   is_eval=False):
     if is_connected is False:
         if cfg['angles'] == 'bins':
-            return calculate_loss_multi_head_bins(data, model, criterion, loss_weights,losses)
-        return calculate_loss_multi_head(data, model, criterion, loss_weights, losses)
+            return calculate_loss_multi_head_bins(data, model, criterion, loss_weights, losses)
+        return calculate_loss_multi_head(data, model, criterion, loss_weights, losses, cfg['sample_weight'], is_eval)
     if is_gnn:
         inputs = data.to(device)
         outputs = model(inputs)
@@ -249,7 +339,7 @@ def record_losses(losses, wandb_, len_data, epoch, phase):
 
 
 def eval_epoch(model, val_loader, criterion, epoch, val_loss, wandb_, is_regression, n_classes, acc,
-               max_epoch, cfg, is_gnn=True):
+               max_epoch, cfg, is_gnn=True, temp_scaling=False, record_in_wandb=True):
     is_connected = cfg['is_connected']
     is_ca = 'ca_pred' not in cfg or cfg['ca_pred']
     is_cb = cfg['cb_pred']
@@ -273,7 +363,7 @@ def eval_epoch(model, val_loader, criterion, epoch, val_loss, wandb_, is_regress
             # with torch.cuda.amp.autocast():
             cur_loss, inputs, outputs, labels = calculate_loss(is_gnn, data, model, criterion,
                                                                n_classes, loss_weights, cfg,
-                                                               is_connected, losses)
+                                                               is_connected, losses, True)
             total_loss += cur_loss
             if is_connected is False:
                 ca_pred.append(outputs[0])
@@ -298,29 +388,37 @@ def eval_epoch(model, val_loader, criterion, epoch, val_loss, wandb_, is_regress
             if is_ca:
                 accuracy, y_prob, wrong_dist, correct_idx = calc_accuracy(torch.cat(ca_pred, dim=0).to('cpu', non_blocking=True),
                                                                           torch.cat(ca_labels, dim=0).to('cpu', non_blocking=True),
-                                                                          confusion_matrix, n_classes)
+                                                                          confusion_matrix, n_classes, None, cfg['loss_type'],
+                                                                          temp_s=temp_scaling)
                 acc.append(accuracy)
-                wandb_.log({'epoch': epoch, 'Accuracy / Validation': accuracy})
                 per_class_acc = confusion_matrix.diag() / confusion_matrix.sum(1)
-                wandb_.log({'epoch': epoch, "Per-Class-Accuracy / Validation":
-                          {ii: ac for ii, ac in enumerate(per_class_acc)}})
+                if record_in_wandb:
+                    wandb_.log({'epoch': epoch, 'Accuracy / Validation': accuracy})
+                    wandb_.log({'epoch': epoch, "Per-Class-Accuracy / Validation":
+                               {ii: ac for ii, ac in enumerate(per_class_acc)}})
                 print(confusion_matrix)
                 print('per class acc: ', per_class_acc)
                 if epoch == max_epoch:
-                    predicted_probabilities = np.asarray(y_prob.to('cpu', non_blocking=True)).flatten()
-                    true_labels = np.asarray(torch.cat(ca_labels, dim=0).to('cpu', non_blocking=True)).flatten()
+                    if not temp_scaling:
+                        predicted_probabilities = np.asarray(y_prob.to('cpu', non_blocking=True)).flatten()
+                        true_labels = np.asarray(torch.cat(ca_labels, dim=0).int().to('cpu')).flatten()
+                    else:
+                        predicted_probabilities = y_prob.to('cpu', non_blocking=True)
+                        true_labels = torch.cat(ca_labels, dim=0).int().to('cpu')
             if is_cb:
                 accuracy_cb, y_prob_cb, _, _ = calc_accuracy(torch.cat(cb_pred, dim=0).to('cpu', non_blocking=True),
                                                              torch.cat(cb_labels, dim=0).to('cpu', non_blocking=True),
-                                                             confusion_matrix_cb, n_classes)
-                wandb_.log({'epoch': epoch, 'Accuracy_CB / Validation': accuracy_cb})
+                                                             confusion_matrix_cb, n_classes, None, cfg['loss_type'])
                 per_class_acc_cb = confusion_matrix_cb.diag() / confusion_matrix_cb.sum(1)
-                wandb_.log({'epoch': epoch, "Per-Class-Accuracy_CB / Validation":
-                    {ii: ac for ii, ac in enumerate(per_class_acc_cb)}})
+                if record_in_wandb:
+                    wandb_.log({'epoch': epoch, 'Accuracy_CB / Validation': accuracy_cb})
+                    wandb_.log({'epoch': epoch, "Per-Class-Accuracy_CB / Validation":
+                               {ii: ac for ii, ac in enumerate(per_class_acc_cb)}})
 
         val_loss.append(total_loss)
-        wandb_.log({'epoch': epoch, 'Loss / Validation': total_loss})
-        record_losses(losses.to('cpu', non_blocking=True), wandb_, len(val_loader), epoch, 'Validation')
+        if record_in_wandb:
+            wandb_.log({'epoch': epoch, 'Loss / Validation': total_loss})
+            record_losses(losses.to('cpu', non_blocking=True), wandb_, len(val_loader), epoch, 'Validation')
         print("Finished Evaluation epoch:", epoch, " loss: ", total_loss)
         return per_class_acc, predicted_probabilities, true_labels, confusion_matrix
 
@@ -341,26 +439,29 @@ def train_epoch(model, train_loader, criterion, _optimizer, epoch, train_loss, w
     ca_pred, cb_pred, ca_labels, cb_labels = [], [], [], []
     omega_pred, omega_labels, theta_pred, theta_labels, phi_pred, phi_labels = [], [], [], [], [], []
     confusion_matrix = torch.zeros(n_classes, n_classes)
+    inter_or_intra = [0, 0]
     # data_loader = tqdm(train_loader, position=0, leave=True)
     for data in train_loader:
+        inter_or_intra[0] += (data.xl_type.T[0] == 0).sum().item()
+        inter_or_intra[1] += (data.xl_type.T[0] == 1).sum().item()
         _optimizer.zero_grad(set_to_none=True)
         # with torch.cuda.amp.autocast():
         cur_loss, inputs, outputs, labels = calculate_loss(is_gnn, data, model, criterion,
                                                            n_classes, loss_weights, cfg, is_connected,
-                                                           losses)
+                                                           losses, False)
         cur_loss.backward()
         _optimizer.step()
 
         # running_loss += cur_loss.item()
         total_loss += cur_loss
         if is_connected is False:
-            ca_pred.append(outputs[0])
-            ca_labels.append(labels[0])
+            ca_pred.append(outputs[0].to('cpu', non_blocking=True))
+            ca_labels.append(labels[0].to('cpu', non_blocking=True))
             # tmp_acc, y_prob, wrong_dist, correct_idx = calc_accuracy(outputs[0].to('cpu'), labels[0].to('cpu'),
             #                                                          confusion_matrix, n_classes)
             if is_cb:
-                cb_pred.append(outputs[1])
-                cb_labels.append(labels[1])
+                cb_pred.append(outputs[1].to('cpu', non_blocking=True))
+                cb_labels.append(labels[1].to('cpu', non_blocking=True))
                 # tmp_acc_cb, y_prob_cb, _, _ = calc_accuracy(outputs[1].to('cpu'), labels[1].to('cpu'),
                 #                                             None, n_classes)
                 # accuracy_cb += tmp_acc_cb
@@ -401,7 +502,7 @@ def train_epoch(model, train_loader, criterion, _optimizer, epoch, train_loss, w
     if is_ca:
         accuracy, y_prob, wrong_dist, correct_idx = calc_accuracy(torch.cat(ca_pred, dim=0).to('cpu', non_blocking=True),
                                                                   torch.cat(ca_labels, dim=0).to('cpu', non_blocking=True),
-                                                                  confusion_matrix, n_classes)
+                                                                  confusion_matrix, n_classes, None, cfg['loss_type'])
         acc.append(accuracy)
         wandb_.log({'epoch': epoch, 'Accuracy / Train': accuracy})
         per_class_acc = confusion_matrix.diag() / confusion_matrix.sum(1)
@@ -411,7 +512,8 @@ def train_epoch(model, train_loader, criterion, _optimizer, epoch, train_loss, w
         print("Finished epoch:", epoch, " loss: ", total_loss, " accuracy: ", accuracy)
     if is_cb:
         accuracy_cb, y_prob_cb, _, _ = calc_accuracy(torch.cat(cb_pred, dim=0).to('cpu', non_blocking=True),
-                                                     torch.cat(cb_labels, dim=0).to('cpu', non_blocking=True), None, n_classes)
+                                                     torch.cat(cb_labels, dim=0).to('cpu', non_blocking=True),
+                                                     None, n_classes, None, cfg['loss_type'])
         # accuracy_cb = accuracy_cb / len(train_loader)
         wandb_.log({'epoch': epoch, 'Accuracy_CB / Train': accuracy_cb})
     record_losses(losses.to('cpu', non_blocking=True), wandb_, len(train_loader), epoch, 'Train')
@@ -423,6 +525,8 @@ def train_epoch(model, train_loader, criterion, _optimizer, epoch, train_loss, w
                          torch.cat(theta_labels, dim=0).to('cpu', non_blocking=True),
                          torch.cat(phi_labels, dim=0).to('cpu', non_blocking=True)]
         record_angles_accuracy(angles_out, angles_labels, wandb_, epoch, cfg)
+    print(f"inter samples: {inter_or_intra[0]}")
+    print(f"intra samples: {inter_or_intra[1]}")
 
 
 def update_loss_weights(cfg):
@@ -452,9 +556,21 @@ def get_multi_head_criterion(cfg, weights):
                     device))
     if 'ca_pred' in cfg and cfg['ca_pred']:
         if cfg['num_classes'] > 2:
-            ca_crit = torch.nn.CrossEntropyLoss(reduction='mean', weight=calc_weights[0])
+            if cfg['loss_type'] == 'ordinal':
+                ca_crit = ordinal_regression
+            elif cfg['loss_type'] == 'corn':
+                ca_crit = loss_corn
+            elif cfg['sample_weight']:
+                ca_crit = torch.nn.CrossEntropyLoss(reduction='none', weight=calc_weights[0])
+            else:
+                ca_crit = torch.nn.CrossEntropyLoss(reduction='mean', weight=calc_weights[0])
             if cfg['cb_pred']:
-                cb_crit = torch.nn.CrossEntropyLoss(reduction='mean', weight=calc_weights[1])
+                if cfg['loss_type'] == 'ordinal':
+                    cb_crit = ordinal_regression
+                elif cfg['loss_type'] == 'corn':
+                    cb_crit = loss_corn
+                else:
+                    cb_crit = torch.nn.CrossEntropyLoss(reduction='mean', weight=calc_weights[1])
         else:
             ca_crit = torch.nn.BCEWithLogitsLoss(pos_weight=calc_weights[0])
             if cfg['cb_pred']:
@@ -478,9 +594,9 @@ def get_multi_head_criterion(cfg, weights):
 
 
 def get_criterion(cfg, data=None):
-    if data is not None and (cfg['weight'] is True or cfg['distance_th_classification'] == 'manual'):
+    if data is not None and (cfg['weight'] is True):
         if cfg['model_type'] == 'gnn':
-            weights = data.dataset.get_label_count()
+            weights = data.dataset.get_label_count(data.indices)
             if not cfg['is_connected']:
                 return get_multi_head_criterion(cfg, weights)
         else:
@@ -535,8 +651,22 @@ def add_hparams_to_tb(writer, cfg, loss, total_accuracy, per_class_acc, auc, rec
                         'hparam/precision': precision})
 
 
-def load_data(cfg, train_data, eval_data):
-    # num_workers = 1
+def load_data(cfg, train_data, eval_data=None, shuffle=True):
+    val_loader = None
+    train_sampler = None
+    if cfg['loss_type'] == 'corn':
+        train_sampler = graph_dataset.ImbalancedDatasetSampler(dataset=train_data,
+                                                               callback_get_label=graph_dataset.XlPairGraphDataset.get_ca_labels)
+        shuffle = False
+    elif cfg['sample'] and train_data != eval_data and cfg['xl_type_feature']:
+        inter_idx = (train_data.dataset.data.xl_type.T[0] == 0).nonzero(as_tuple=True)[0]
+        train_inter_idx = list(set(inter_idx.tolist()).intersection(train_data.indices.tolist()))
+        train_inter_idx = torch.tensor([(train_data.indices == i).nonzero(as_tuple=True)[0] for i in train_inter_idx])
+        weights = torch.ones(len(train_data.indices))
+        weights[train_inter_idx] = 15
+        generator = torch.Generator().manual_seed(3407)
+        train_sampler = WeightedRandomSampler(weights, len(weights), generator=generator)
+        shuffle = False
     if cfg['debug']:
         num_workers = 1
     else:
@@ -544,26 +674,36 @@ def load_data(cfg, train_data, eval_data):
     # num_workers = 1
     if cfg['model_type'] == 'gnn':
         if cfg['is_connected']:
-            train_loader = PyG_DataLoader(train_data, cfg['batch_size'], shuffle=True,
-                                          num_workers=num_workers, pin_memory=True)
-            val_loader = PyG_DataLoader(eval_data, cfg['batch_size'], shuffle=True,
-                                        num_workers=num_workers, pin_memory=True)
+            train_loader = PyG_DataLoader(train_data, cfg['batch_size'], shuffle=shuffle,
+                                          num_workers=num_workers, pin_memory=True, sampler=None)
+            if eval_data is not None:
+                val_loader = PyG_DataLoader(eval_data, cfg['batch_size'], shuffle=shuffle,
+                                            num_workers=num_workers, pin_memory=True)
         else:
-            train_loader = PyG_DataLoader(train_data, cfg['batch_size'], shuffle=True,
-                                          num_workers=num_workers,follow_batch=['x_a', 'x_b'],
-                                          pin_memory=True)
-            val_loader = PyG_DataLoader(eval_data, cfg['batch_size'], shuffle=True,
-                                        num_workers=num_workers, follow_batch=['x_a', 'x_b'],
-                                        pin_memory=True)
+            if torch.cuda.device_count() > 1 and cfg['multi_gpu'] and eval_data is not None:
+                train_loader = PyG_ListLoader(train_data, cfg['batch_size'], shuffle=shuffle,
+                                              num_workers=num_workers,
+                                              pin_memory=True, sampler=train_sampler)
+                val_loader = PyG_ListLoader(eval_data, cfg['batch_size'], shuffle=shuffle,
+                                            num_workers=num_workers,
+                                            pin_memory=True)
+            else:
+                train_loader = PyG_DataLoader(train_data, cfg['batch_size'], shuffle=shuffle,
+                                              num_workers=num_workers, follow_batch=['x_a', 'x_b'],
+                                              pin_memory=True, sampler=train_sampler)
+                if eval_data is not None:
+                    val_loader = PyG_DataLoader(eval_data, cfg['batch_size'], shuffle=shuffle,
+                                                num_workers=num_workers, follow_batch=['x_a', 'x_b'],
+                                                pin_memory=True)
     else:
-        train_loader = DataLoader(train_data, batch_size=cfg['batch_size'], shuffle=True,
+        train_loader = DataLoader(train_data, batch_size=cfg['batch_size'], shuffle=shuffle,
                                   num_workers=num_workers, pin_memory=True)
-        val_loader = DataLoader(eval_data, batch_size=cfg['batch_size'], shuffle=True,
+        val_loader = DataLoader(eval_data, batch_size=cfg['batch_size'], shuffle=shuffle,
                                 num_workers=num_workers, pin_memory=True)
     return train_loader, val_loader
 
 
-def get_labels_th(cfg, wandb_):
+def get_labels_th(cfg):
     n_classes = cfg['num_classes']
     th = cfg['distance_th_classification']
     if th == 'manual':
@@ -572,43 +712,91 @@ def get_labels_th(cfg, wandb_):
         elif n_classes == 3:
             th = random.choice([[12, 18], [13, 18], [13, 20], [12, 20], [13, 21]])
         elif n_classes == 4:
-            th = random.choice([[12, 18, 22], [11, 17, 20], [11, 16, 21], [10, 17, 23], [13, 19, 23]])
+            # th = random.choice([[12, 18, 22], [11, 17, 20], [11, 16, 21], [10, 17, 23], [13, 19, 23]])
+            th = [11.98239517, 16.39906025, 22.83931446]
         elif n_classes == 5:
-            th = random.choice([[10, 14, 18, 22], [11, 17, 21, 25], [11, 14, 17, 22],
-                                 [10, 15, 18, 23], [10, 14, 19, 23]])
+            # th = random.choice([[10, 14, 18, 22], [11, 17, 21, 25], [11, 14, 17, 22],
+            #                      [10, 15, 18, 23], [10, 14, 19, 23]])
+            th = [8, 12, 16, 30]
+        elif n_classes == 6:
+            th = [8, 12, 18, 25, 32]
         elif n_classes == 7:
             th = random.choice([[9, 13, 15, 17, 20, 25], [11, 15, 17, 19, 21, 25], [9, 12, 14, 16, 18, 22],
                                  [10, 13, 17, 20, 23, 28], [12, 17, 19, 21, 25, 29]])
+        elif n_classes == 18:
+            th = [6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38]
+        elif n_classes == 12:
+            th = [7, 10, 13, 16, 19, 22, 25, 28, 31, 34, 37]
         else:
             th = random.sample(range(8, 32), n_classes)
             th.sort()
-        wandb_.log({"label distance th": th})
     return th
 
 
-def get_dataset(cfg, wandb_):
-    th = get_labels_th(cfg, wandb_)
+def split_inter_and_intra_dataset(data, cfg):
+    generator = torch.Generator().manual_seed(3407)
+    inter_idx = (data.data.xl_type.T[0] == 0).nonzero(as_tuple=True)[0]
+    inter_idx = inter_idx[torch.randperm(len(inter_idx), generator=generator)]
+    intra_idx = (data.data.xl_type.T[0] == 1).nonzero(as_tuple=True)[0]
+    intra_idx = intra_idx[torch.randperm(len(intra_idx), generator=generator)]
+    intra_lengths = get_datasets_length(cfg, intra_idx, 0.1, 0.1)
+    inter_lengths = get_datasets_length(cfg, inter_idx, 0.2, 0.1)
+    prev_ter, prev_tra, accumulate_ter, accumulate_tra = 0, 0, 0, 0
+    subsets = []
+    for i in range(len(intra_lengths)):
+        accumulate_tra += intra_lengths[i]
+        accumulate_ter += inter_lengths[i]
+        idx = torch.cat([intra_idx[prev_tra: accumulate_tra], inter_idx[prev_ter: accumulate_ter]])
+        subsets.append(torch.utils.data.Subset(data, indices=idx))
+        prev_tra = accumulate_tra
+        prev_ter = accumulate_ter
+    return subsets
+
+
+def get_datasets_length(cfg, data, eval_fraction, test_fraction):
+    if cfg['debug']:
+        eval_len, test_len = int(len(data) * 0.01), int(len(data) * 0.98)
+    elif cfg['data_type'] == 'predict':
+        eval_len, train_len, test_len = int(len(data)), 0, 0
+    else:
+        eval_len, test_len = int(len(data) * eval_fraction), int(len(data) * test_fraction)
+    train_len = int(len(data) - (eval_len + test_len))
+    return train_len, eval_len, test_len
+
+
+def split_dataset(cfg, data, eval_fraction, test_fraction):
+    generator = torch.Generator().manual_seed(3407)
+    train_len, eval_len, test_len = get_datasets_length(cfg, data, eval_fraction, test_fraction)
+    train_data, eval_data, test_data = random_split(data, [train_len, eval_len, test_len], generator)
+    return train_data, eval_data, test_data
+
+
+def get_dataset(cfg, wandb_=None):
+    th = get_labels_th(cfg)
+    transform = None
+    if cfg['transform']:
+        transform = xl_transforms.FlipTransform()
     if cfg['model_type'] == 'gnn':
         if cfg['is_connected']:
             data = graph_dataset.XlGraphDataset(cfg, th)
         else:
-            transform = None
-            if cfg['transform']:
-                transform = graph_dataset.FlipTransform()
             data = graph_dataset.XlPairGraphDataset(cfg, th, transform=transform)
-        generator = torch.Generator().manual_seed(3407)
-        if cfg['debug']:
-            eval_len, test_len = int(len(data) * 0.01), int(len(data) * 0.98)
+        if cfg['xl_type_feature']:
+            train_data, eval_data, test_data = split_inter_and_intra_dataset(data, cfg)
         else:
-            eval_len, test_len = int(len(data) * 0.1), int(len(data) * 0.1)
-        train_len = int(len(data) - (eval_len + test_len))
-        train_data, eval_data, test_data = random_split(data, [train_len, eval_len, test_len], generator)
+            train_data, eval_data, test_data = split_dataset(cfg, data, 0.1, 0.1)
+        if cfg['data_type'] == 'test':
+            return test_data
+        elif cfg['data_type'] == 'predict':
+            return eval_data, eval_data
     elif cfg['dataset'] == "linker_as_label":
         train_data = data_proccess.LinkerAsLabelDS(cfg, is_train=True)
         eval_data = data_proccess.LinkerAsLabelDS(cfg, is_train=False)
     else:
         train_data = data_proccess.FeatDataset(cfg, is_train=True)
         eval_data = data_proccess.FeatDataset(cfg, is_train=False)
+    if wandb_ is not None:
+        wandb_.log({"label distance th": cfg['distance_th_classification']})
     return train_data, eval_data
 
 
@@ -618,7 +806,108 @@ def get_model(cfg, config=None):
     return mlp.create_model(cfg, config)
 
 
-def train(cfg=None, i=0, checkpoint_dir=None, wandb_=None):
+def temperature_scaling_calibration(model, cfg, wandb_, epoch, _optimizer, loss, val_loader=None, criterion=None):
+    print('model calibration')
+
+    if val_loader is None:
+        train_data, eval_data = get_dataset(cfg, wandb_)
+        train_loader, val_loader = load_data(cfg, train_data, eval_data)
+        criterion = get_criterion(cfg, train_data)[0][0]
+    per_class_acc, predicted_probabilities, true_labels, confusion_matrix = eval_epoch(model,
+                                                                                       val_loader, [criterion],
+                                                                                       cfg['epochs'], [], wandb_,
+                                                                                       False, cfg['num_classes'], [],
+                                                                                       cfg['epochs'], cfg,
+                                                                                       temp_scaling=True)
+    ece = temperature_scaling._ECELoss()
+    ece_score_before = ece(predicted_probabilities, true_labels)
+
+    scaled_model = temperature_scaling.ModelWithTemperature(model)
+    scaled_model.set_temperature(val_loader)
+
+    per_class_acc, predicted_probabilities, true_labels, confusion_matrix = eval_epoch(scaled_model,
+                                                                                       val_loader, [criterion],
+                                                                                       cfg['epochs'], [], wandb_,
+                                                                                       False, cfg['num_classes'], [],
+                                                                                       cfg['epochs'], cfg,
+                                                                                       temp_scaling=True)
+    ece_score_after = ece(predicted_probabilities, true_labels)
+    print(f"ECE before calibrating: {ece_score_before}, after: {ece_score_after}")
+    torch.save({'epoch': epoch, 'model_state_dict': scaled_model.state_dict(),
+                'optimizer_state_dict': _optimizer.state_dict(), 'loss': loss},
+               f"models/{cfg['name']}_scaled")
+    return scaled_model
+
+
+def fine_tune_model(model):
+    for param in model.parameters():
+        param.requires_grad = False
+    for param in model.GNN_A.convs[-1].parameters():
+        param.requires_grad = True
+    for param in model.GNN_B.convs[-1].parameters():
+        param.requires_grad = True
+    for param in model.lin1.parameters():
+        param.requires_grad = True
+    for param in model.lin2.parameters():
+        param.requires_grad = True
+    for param in model.lin3.parameters():
+        param.requires_grad = True
+
+
+def stats_of_inter_xl_performance(model, eval_data, criterion, wandb_, cfg, i, out_size):
+    inter_idx = (eval_data.dataset.data.xl_type.T[0] == 0).nonzero(as_tuple=True)[0]
+    val_inter_idx = list(set(inter_idx.tolist()).intersection(eval_data.indices.tolist()))
+    val_inter_data = torch.utils.data.Subset(eval_data.dataset, val_inter_idx)
+    data_loader, _ = load_data(cfg, val_inter_data, val_inter_data)
+    val_loss, eval_accuracy = list(), list()
+    per_class_acc, predicted_probabilities, true_labels, confusion_matrix = eval_epoch(model, data_loader, criterion,
+                                                                                       cfg['epochs'] - 1, val_loss, wandb_,
+                                                                                       False, cfg['num_classes'], eval_accuracy,
+                                                                                       cfg['epochs'] - 1, cfg, record_in_wandb=False)
+    wandb_.log({'Inter_xl_accuracy': eval_accuracy[-1]})
+    log_results(cfg, wandb_, confusion_matrix, predicted_probabilities, true_labels, i, out_size, 'Inter Xl ')
+
+
+def log_results(cfg, wandb_, confusion_matrix, predicted_probabilities, true_labels, i, out_size, title=''):
+    if 'ca_pred' in cfg and cfg['ca_pred']:
+        auc_roc, recall, precision = calc_precision_recall_roc(confusion_matrix, cfg['num_classes'],
+                                                               predicted_probabilities, true_labels, cfg, i)
+        if cfg['num_classes'] == 2:
+            wandb_.log({"pr": wandb.plot.pr_curve(true_labels,
+                                                  np.reshape(predicted_probabilities,
+                                                             (true_labels.shape[0], out_size)), classes_to_plot=0)})
+            prob_complete = -predicted_probabilities + 1
+            reshaped_probas = np.reshape(predicted_probabilities, (predicted_probabilities.shape[0], 1))
+            prob_complete = np.reshape(prob_complete, (prob_complete.shape[0], 1))
+            probas = np.concatenate((prob_complete, reshaped_probas), axis=1)
+        elif cfg['loss_type'] != 'corn':
+            probas = np.reshape(predicted_probabilities, (true_labels.shape[0], out_size))
+        th = list(cfg['distance_th_classification'])
+        if th is None or th == 'None':
+            th = [11.897181510925293, 16.312454223632812, 22.885560989379883]
+        th.append(45)
+        th.insert(0, 0)
+        th = [(round(th_i, 1)) for th_i in th]
+        class_names = [f"{th[j]}-{th[j + 1]}" for j in range(len(th) - 1)]
+        if cfg['loss_type'] != 'corn':
+            wandb_.log({f"{title}roc": wandb.plot.roc_curve(true_labels, probas, classes_to_plot=0, title=f"{title}ROC")})
+            cm = wandb.plot.confusion_matrix(y_true=true_labels.tolist(), probs=probas,
+                                             class_names=class_names, title=f"{title}Confusion Matrix (Validation)")
+        else:
+            preds = np.reshape(predicted_probabilities, (true_labels.shape[0], out_size - 1))
+            preds = label_from_corn_logits(torch.from_numpy(preds))
+            cm = wandb.plot.confusion_matrix(y_true=true_labels.tolist(), preds=preds.tolist(),
+                                             class_names=class_names, title=f"{title}Confusion Matrix (Validation)")
+        wandb_.log({f"{title}conf_mat": cm})
+        wandb_.log({f"{title}recall": recall})
+        wandb_.log({f"{title}precision": precision})
+        wandb_.log({f"{title}auc": auc_roc})
+        fig = general_utils.plot_roc(true_labels, probas, "ROC curve", cfg['num_classes'])
+        wandb_.log({f"{title}roc_plot_multiclass": fig})
+        # plot_cm(true_labels, probas)
+
+
+def train(cfg=None, i=0, wandb_=None):
     if wandb_ is None:
         wandb_ = wandb.init(project="xl_gnn", entity="seanco", config=cfg)
     print(cfg, flush=True)
@@ -627,14 +916,31 @@ def train(cfg=None, i=0, checkpoint_dir=None, wandb_=None):
     else:
         out_size = cfg['num_classes']
     model = get_model(cfg)
-    model.to(device)
     model.float()
+    if torch.cuda.device_count() > 1 and cfg['multi_gpu']:
+        print("Let's use", torch.cuda.device_count(), "GPUs!")
+        model = torch_geometric.nn.DataParallel(model)
+    model.to(device)
+    if 'fine_tune' in cfg and cfg['fine_tune']:
+        fine_tune_model(model)
     _optimizer = construct_optimizer(model.parameters(), cfg)
     scheduler = get_scheduler(cfg, _optimizer)
-    if checkpoint_dir:
-        model_state, optimizer_state = torch.load(os.path.join(checkpoint_dir, "checkpoint"))
-        model.load_state_dict(model_state)
-        _optimizer.load_state_dict(optimizer_state)
+    initial_epoch = 0
+    if 'exist_model' in cfg and cfg['exist_model'] is not None:
+        if cfg['exist_model'].split('_')[-1] == 'scaled':
+            model = temperature_scaling.ModelWithTemperature(model)
+            model.to(device)
+        checkpoint = torch.load(f"/cs/labs/dina/seanco/xl_mlp_nn/models/{cfg['exist_model']}")
+        # model.load_state_dict(checkpoint)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        _optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        initial_epoch = checkpoint['epoch']
+        if cfg['data_type'] != 'Train' or cfg['fine_tune']:
+            initial_epoch = 0
+        loss = checkpoint['loss']
+        if cfg['calibrate_model'] == 'start':
+            return temperature_scaling_calibration(model, cfg, wandb_, initial_epoch, _optimizer, loss)
+            # return temperature_scaling_calibration(model, cfg, wandb_, initial_epoch, _optimizer, 1)
     train_loss, val_loss, eval_accuracy, train_accuracy, per_class_acc = list(), list(), list(), list(), list()
     train_data, eval_data = get_dataset(cfg, wandb_)
     # graph_dataset.test_pair_graph_dataloader(train_data)
@@ -643,10 +949,11 @@ def train(cfg=None, i=0, checkpoint_dir=None, wandb_=None):
     # writer = SummaryWriter()
     epochs = cfg['epochs']
     # update_loss_weights(cfg)
-    for epoch in range(epochs):
+    for epoch in range(initial_epoch, epochs):
         try:
-            train_epoch(model, train_loader, criterion, _optimizer, epoch, train_loss, wandb_, scheduler,
-                        train_accuracy, cfg['num_classes'], cfg['epochs'] - 1, cfg)
+            if cfg['data_type'] == 'Train':
+                train_epoch(model, train_loader, criterion, _optimizer, epoch, train_loss, wandb_, scheduler,
+                            train_accuracy, cfg['num_classes'], cfg['epochs'] - 1, cfg)
             # update_lr(optimizer, epoch, cfg)
 
             # Evaluate the model.
@@ -663,25 +970,18 @@ def train(cfg=None, i=0, checkpoint_dir=None, wandb_=None):
             raise e
 
     print("Finished Training")
-    if 'ca_pred' in cfg and cfg['ca_pred']:
-        auc_roc, recall, precision = calc_precision_recall_roc(confusion_matrix, cfg['num_classes'],
-                                                               predicted_probabilities, true_labels, cfg, i)
-        wandb_.log({"pr": wandb.plot.pr_curve(true_labels,
-                                    np.reshape(predicted_probabilities, (true_labels.shape[0],
-                                                                         out_size)), classes_to_plot=0)})
-        if cfg['num_classes'] == 2:
-            prob_complete = -predicted_probabilities + 1
-            reshaped_probas = np.reshape(predicted_probabilities, (predicted_probabilities.shape[0], 1))
-            prob_complete = np.reshape(prob_complete, (prob_complete.shape[0], 1))
-            probas = np.concatenate((prob_complete, reshaped_probas), axis=1)
+    log_results(cfg, wandb_, confusion_matrix, predicted_probabilities, true_labels, i, out_size)
+    if cfg['xl_type_feature']:
+        stats_of_inter_xl_performance(model, eval_data, criterion, wandb_, cfg, i, out_size)
+    if cfg['name'] != 'None':
+        if cfg['calibrate_model'] == 'end':
+            temperature_scaling_calibration(model, cfg, wandb_, epoch, _optimizer, train_loss[-1], val_loader,
+                                            criterion[0])
         else:
-            probas = np.reshape(predicted_probabilities, (true_labels.shape[0], out_size))
-        wandb_.log({"roc": wandb.plot.roc_curve(true_labels, probas, classes_to_plot=0)})
-        cm = wandb.plot.confusion_matrix(y_true=true_labels.tolist(), probs=probas)
-        wandb_.log({"conf_mat": cm})
-        wandb_.log({'recall': recall})
-        wandb_.log({'precision': precision})
-        wandb_.log({'auc': auc_roc})
+            print("saving model")
+            torch.save({'epoch': epoch, 'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': _optimizer.state_dict(), 'loss': train_loss[-1]},
+                       f"models/{cfg['name']}")
 
 
 def parameters_tune(args, cfg=None, sweeps=False):
@@ -734,11 +1034,10 @@ class TrainingParser(argparse.ArgumentParser):
             "--cfg",
             dest="cfg_file",
             help="Path to the config file",
-            # default="/cs/labs/dina/seanco/xl_mlp_nn/configs/gnn_separate_39f_angles.yaml",
-            # default="/cs/labs/dina/seanco/xl_mlp_nn/configs/sweeps_gnn_separate_39f_angles.yaml",
-            # default="/cs/labs/dina/seanco/xl_mlp_nn/configs/sweeps_single_n_classes.yaml",
-            # default="/cs/labs/dina/seanco/xl_mlp_nn/configs/sweeps_grid.yaml",
-            default="/cs/labs/dina/seanco/xl_mlp_nn/configs/sweeps_heads_grid.yaml",
+            default="/cs/labs/dina/seanco/xl_mlp_nn/configs/gnn_separate_44f_3a.yaml",
+            # default="/cs/labs/dina/seanco/xl_mlp_nn/configs/eval_inter_44f_3a.yaml",
+            # default="/cs/labs/dina/seanco/xl_mlp_nn/configs/debug_config.yaml",
+            # default="/cs/labs/dina/seanco/xl_mlp_nn/configs/sweep_gat_44.yaml",
             type=str,
         )
         self.add_argument(
@@ -763,32 +1062,6 @@ class TrainingParser(argparse.ArgumentParser):
         return args
 
 
-def upd_cfg_by_sweeps(cfg, sweeps_cfg):
-    cfg['num_classes'] = sweeps_cfg['num_classes']
-    cfg['dropout'] = sweeps_cfg['dropout']
-    cfg['MODEL']['DISTANCE_TH_CLASSIFICATION'] = sweeps_cfg['distance_th_classification']
-    cfg['hidden_layers'] = sweeps_cfg['hidden_layers']
-    cfg['layers'] = sweeps_cfg['layers']
-    cfg['MODEL']['SAMPLE'] = sweeps_cfg['sample']
-    cfg['MODEL']['POOL_RATIO'] = sweeps_cfg['pool_ratio']
-    cfg['MODEL']['POOL_POLICY'] = sweeps_cfg['pool_policy']
-    cfg['cb_pred'] = sweeps_cfg['cb_pred']
-    cfg['omega_pred'] = sweeps_cfg['omega_pred']
-    cfg['theta_pred'] = sweeps_cfg['theta_pred']
-    cfg['loss_head_weights'] = sweeps_cfg['loss_head_weights']
-    cfg['base_lr'] = sweeps_cfg['base_lr']
-    cfg['SOLVER']['MOMENTUM'] = sweeps_cfg['momentum']
-    cfg['weight_decay'] = sweeps_cfg['weight_decay']
-    cfg['optimizing_method'] = sweeps_cfg['optimizing_method']
-    cfg['scheduler'] = sweeps_cfg['scheduler']
-    cfg['steps'] = sweeps_cfg['steps']
-    cfg['gamma'] = sweeps_cfg['gamma']
-    cfg['batch_size'] = sweeps_cfg['batch_size']
-    cfg['epochs'] = sweeps_cfg['epochs']
-    cfg['weight'] = sweeps_cfg['weight']
-    return cfg
-
-
 def train_with_sweeps():
     # cfg = load_config(None)
     # with wandb.init(config=cfg, project='xl_gnn', entity='seanco') as wandb_:
@@ -804,14 +1077,15 @@ def train_with_sweeps():
 
 def run_with_sweeps(config):
     wandb.login()
-    sweep_id = wandb.sweep(config, entity='seanco', project='xl_gnn')
-    wandb.agent(sweep_id, project='xl_gnn', entity='seanco', function=train_with_sweeps)
-    # wandb.agent('luuxdeg9', project='xl_gnn', entity='seanco', function=train_with_sweeps)
+    # sweep_id = wandb.sweep(config, entity='seanco', project='xl_gnn')
+    # wandb.agent(sweep_id, project='xl_gnn', entity='seanco', function=train_with_sweeps)
+    wandb.agent('gfu40i73', project='xl_gnn', entity='seanco', function=train_with_sweeps)
 
 
 if __name__ == "__main__":
+    xl_objects = cross_link.get_upd_and_filter_processed_objects_pipeline('processed_xl_objects_intra_lys')
+    graph_dataset.generate_graph_data(xl_objects, data_name='44f_3A_intra_lys_dataset', edge_dist_th=3)
     print("Start main\n", flush=True)
     seed_everything()
-    # train_with_sweeps()
     args = parse_args()
-    parameters_tune(args, None, True)
+    parameters_tune(args, None, False)

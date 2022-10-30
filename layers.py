@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch_geometric
 from sparse_softmax import Sparsemax
 from torch.nn import Parameter
 from torch_geometric.data import Data
@@ -9,6 +10,7 @@ from torch_geometric.nn.pool.topk_pool import topk, filter_adj
 from torch_geometric.utils import softmax, dense_to_sparse, add_remaining_self_loops
 from torch_scatter import scatter_add
 from torch_sparse import spspmm, coalesce
+from torch_geometric.nn import global_mean_pool as gap, global_max_pool as gmp, global_add_pool as gsp
 
 
 class TwoHopNeighborhood(object):
@@ -257,4 +259,53 @@ class HGPSLPool(torch.nn.Module):
             del adj
             torch.cuda.empty_cache()
 
-        return x, new_edge_index, new_edge_attr, batch
+        y = torch.cat([gsp(x, batch), gap(x, batch)], dim=1)
+        return x, new_edge_index, new_edge_attr, batch, y
+
+
+class CaPool(torch.nn.Module):
+    def __init__(self, global_pool=torch_geometric.nn.glob.global_add_pool, is_hpsl=False):
+        super(CaPool, self).__init__()
+        self.is_hpsl = is_hpsl
+        self.pool = global_pool
+
+    def forward(self, x, edge_index, edge_attr, batch=None):
+        if self.is_hpsl:
+            x, edge_index, edge_attr, batch = self.pool(x, edge_index, edge_attr, batch)
+            y = torch.cat([gsp(x, batch), gap(x, batch)], dim=1)
+        else:
+            y = self.pool(x, batch)
+        ca_i = []
+        for i in range(len(y)):
+            ca_i.append(x[batch == i][0])
+        ca = torch.stack(ca_i, dim=0)
+        y = torch.cat([y, ca], dim=1)
+        return x, edge_index, edge_attr, batch, y
+
+
+class customPool(torch.nn.Module):
+    def __init__(self, nhid=128, pooling_ratio=0.8, sample=False, sparse=True, sl=True, lamb=1.0, global_pool='sum',
+                 is_ca_pool=False):
+        super(customPool, self).__init__()
+        self.is_edges_param = False
+        self.is_hgpsl = False
+        if global_pool == 'sum':
+            self.pool = torch_geometric.nn.glob.global_add_pool
+        elif global_pool == 'avg':
+            self.pool = torch_geometric.nn.glob.global_mean_pool
+        elif global_pool == 'max':
+            self.pool = torch_geometric.nn.glob.global_max_pool
+        else:
+            self.is_edges_param = True
+            self.is_hgpsl = True
+            self.pool = HGPSLPool(nhid, pooling_ratio, sample, sparse, sl, lamb)
+        if is_ca_pool:
+            self.is_edges_param = True
+            self.pool = CaPool(self.pool, self.is_hgpsl)
+
+    def forward(self, x, edge_index, edge_attr, batch=None):
+        if self.is_edges_param:
+            x, edge_index, edge_attr, batch, y = self.pool(x, edge_index, edge_attr, batch)
+        else:
+            y = self.pool(x, batch)
+        return x, edge_index, edge_attr, batch, y

@@ -1,0 +1,95 @@
+program: train.py
+method: grid
+project: xl_gnn
+entity: seanco
+parameters:
+  num_classes:
+    value: 4
+  dropout:
+    value: 0.0
+  output_size:
+    value: 4
+  distance_th_classification:
+    value: None
+  hidden_layers:
+    value: 3
+  layers:
+    value: 128
+  model_type:
+    value: gnn
+  sample:
+    value: True
+  pool_ratio:
+    value: 0.2
+  pool_policy:
+    value: all
+  ca_pred:
+    value: True
+  cb_pred:
+    value: False
+  omega_pred:
+    value: False
+  theta_pred:
+    value: False
+  phi_pred:
+    value: False
+  loss_head_weights:
+    value: [1, 0.1, 1, 1, 1]
+  debug:
+    value: False
+  data_type:
+    value: Train
+  similarity_clear:
+    value: 0.05
+  dataset:
+    value: 39f_5A_dataset
+  node_feat:
+    value: 39
+  is_connected:
+    value: False
+  base_lr:
+    value: 0.001
+  momentum:
+    value: 0.9
+  weight_decay:
+    value: 0
+  optimizing_method:
+    value: adam
+  scheduler:
+    value: None
+  steps:
+    value: None
+  gamma:
+    value: 0.2
+  batch_size:
+    value: 80
+  epochs:
+    value: 50
+  hparam_method:
+    value: sweeps
+  hparam_tune:
+    value: False
+  loss_type:
+    value: bce
+  weight:
+    value: True
+  name:
+    value: None
+  transform:
+    value: True
+  angles:
+    value: regression
+  sample_weight:
+    value: False
+  multi_gpu:
+    value: False
+  calibrate_model:
+    value: start
+  gnn_type:
+    values: [gine, gin, gcn, gat, hgpsl]
+  activation:
+    value: prelu
+  batchnorm:
+    value: True
+  attention_heads:
+    value: 4

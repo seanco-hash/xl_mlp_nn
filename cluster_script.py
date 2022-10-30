@@ -6,28 +6,31 @@ WORKDIR = "/cs/labs/dina/seanco/xl_mlp_nn/"
 
 out_dir = WORKDIR + 'scripts/'
 
-ask_time = "2-0"
-mem = "48G"
-cpus = "4"
+ask_time = "7:00:00"
+mem = "128G"
+cpus = "6"
 gpus = "1"
-gpu_mem = "10g"
+gpu_mem = "24g"
 INTRO = "#!/bin/tcsh \n" \
         "#SBATCH --mem=" + mem + "\n" \
-        "#SBATCH -c" + cpus + " \n" \
-        "#SBATCH --time=" + ask_time + "\n" \
-      "cd /cs/labs/dina/seanco/xl_mlp_nn/\n"
+                                 "#SBATCH -c" + cpus + " \n" \
+                                                       "#SBATCH --time=" + ask_time + "\n" \
+                                                                                      "cd /cs/labs/dina/seanco/xl_mlp_nn/\n"
 PYTHON = "python3 "
 TRAIN = 'train.py'
 TRAIN2 = 'train2.py'
 SWEEPS = '/cs/labs/dina/seanco/xl_parser/xl_db_parser_venv/bin/wandb agent seanco/xl_gnn/k4v2onan'
 
 DATASET_RUN = 'graph_dataset.py'
+#
+# INLINE_INTRO = "--mem=" + mem + " -c" + cpus + " --time=" + ask_time + " --gres=gpu:" + gpus + "," \
+#                "vmem:" + gpu_mem + " --killable "
 
-INLINE_INTRO = "--mem=" + mem + " -c" + cpus + " --time=" + ask_time + " --gres=gpu:" + gpus + "," \
-               "vmem:" + gpu_mem + " --killable --requeue "
-
-# INLINE_INTRO = "--mem=" + mem + " -c" + cpus + " --time=" + ask_time + " --partition=puffin --gres=gpu:a30 "
+# INLINE_INTRO = "--mem=" + mem + " -c" + cpus + " --time=" + ask_time + " --gres gpu:a100-3-40 "
+INLINE_INTRO = "--mem=" + mem + " -c" + cpus + " --time=" + ask_time + " --partition=puffin --gres=gpu:a30 "
 # INLINE_INTRO = "--mem=" + mem + " -c" + cpus + " --time=" + ask_time + " --gres=gpu:a100-1-10 "
+# salloc --mem=16G -c 1 --time=1:00:00 --gres=gpu:a100-1-10
+# salloc --mem=8G -c 2 --time=2:00:00 -w glacier-36
 
 INLINE_INTRO_CPU = "--mem=" + mem + " -c" + cpus + " --time=" + ask_time + " "
 

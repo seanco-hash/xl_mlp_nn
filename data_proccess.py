@@ -184,7 +184,7 @@ class FeatDataset(Dataset):
             percentiles = np.percentile(dist, perc_arr)
         else:
             percentiles = th
-        return FeatDataset.get_labels_by_thresholds(dist, percentiles)
+        return FeatDataset.get_labels_by_thresholds(dist, percentiles), percentiles
 
     @staticmethod
     def delete_similar_features(features, labels, clear_th=0.05):
