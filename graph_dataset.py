@@ -59,6 +59,19 @@ RESIDUE_TYPE_END = 39
 ANCHOR_DIST_IDX = 39
 ID_ENCODING_START = 40
 ID_ENCODING_END = 44
+MAX_FEATURES = torch.tensor([ 1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,
+                        1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.1100,
+                        44.2074,  2.2650,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,
+                        1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,
+                        1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000, 16.4794,
+                        1.0000,  1.0000,  1.0000,  1.0000], dtype=torch.float64)
+MIN_FEATURES = torch.tensor([ 0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,
+                        0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000, -0.7200,
+                        0.0000,  1.4300,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,
+                        0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,
+                        0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,
+                        0.0500,  0.0722,  0.0411,  0.0315], dtype=torch.float64)
+MAX_LINKER_FEATURE = torch.tensor(34.4000)
 
 
 class ImbalancedDatasetSampler(Sampler):
@@ -382,14 +395,18 @@ def add_xl_type_feature(obj):
 
 
 def generate_single_xl_data(obj, feat_dict, cif_files, problems, edge_dist_th=5,  two_graphs_data=True,
-                            inter_pdbs=None):
-    uni_a, uni_b = pdb_files_manager.find_feature_dict_keys_from_xl_obj(obj, feat_dict, problems, cif_files, inter_pdbs)
+                            inter_pdbs=None, predict=False):
+    uni_a, uni_b = pdb_files_manager.find_feature_dict_keys_from_xl_obj(obj, feat_dict, problems, cif_files, inter_pdbs,
+                                                                        feat_by_pdb=True, predict=predict)
+    if uni_a is None or uni_b is None or obj.res_num_a not in feat_dict[uni_a] or obj.res_num_b not in feat_dict[uni_b]:
+        uni_a, uni_b = pdb_files_manager.find_feature_dict_keys_from_xl_obj(obj, feat_dict, problems, cif_files,
+                                                                            inter_pdbs=None, feat_by_pdb=False, predict=predict)
+        if uni_a is None or uni_b is None or obj.res_num_a not in feat_dict[uni_a] or obj.res_num_b not in feat_dict[uni_b]:
+            problems[1] += 1
+            print(f"Problem type 1 with:{obj.pdb_file} {obj.uniport_a}, {obj.uniport_b} residues: {obj.res_num_a}, {obj.res_num_b}")
+            return None
     uniport_feat_dict_a = feat_dict[uni_a]
     uniport_feat_dict_b = feat_dict[uni_b]
-    if obj.res_num_a not in uniport_feat_dict_a or obj.res_num_b not in uniport_feat_dict_b:
-        problems[1] += 1
-        print(f"Problem type 1 with: {uni_a}, {uni_b} residues: {obj.res_num_a}, {obj.res_num_b}")
-        return None
     res_a_feat = torch.from_numpy(np.stack(uniport_feat_dict_a[obj.res_num_a][:-1]))  # -1 - last is distance
     res_a_feat = mol2_type_to_onehot(res_a_feat)
     res_a_feat = res_type_to_onehot(res_a_feat)
@@ -397,7 +414,7 @@ def generate_single_xl_data(obj, feat_dict, cif_files, problems, edge_dist_th=5,
     res_b_feat = mol2_type_to_onehot(res_b_feat)
     res_b_feat = res_type_to_onehot(res_b_feat)
     if res_a_feat is None or res_b_feat is None:
-        print(f"Problem type 2 with: {obj.uniport_a}, residues: {obj.res_num_a}, {obj.res_num_b}")
+        print(f"Problem type 2 with:{obj.pdb_file} {obj.uniport_a}, residues: {obj.res_num_a}, {obj.res_num_b}")
         problems[2] += 1
         return None
     dist_a, dist_b = uniport_feat_dict_a[obj.res_num_a][-1], uniport_feat_dict_b[obj.res_num_b][-1]
@@ -440,7 +457,8 @@ def generate_single_xl_data(obj, feat_dict, cif_files, problems, edge_dist_th=5,
 
 
 def generate_graph_data(processed_xl_objects=None, feature_dict=None, pid=None, cif_files=None,
-                        data_name=SEPARATE_39F_ANGLES_DATASET, pdb_path=None, edge_dist_th=5):
+                        data_name=SEPARATE_39F_ANGLES_DATASET, pdb_path=None, edge_dist_th=3, inter_pdbs=None,
+                        save=True, data=None, predict=False):
     if feature_dict is None:
         feature_dict = pdb_files_manager.get_xl_neighbors_dict()
         print(f"dict size: {len(feature_dict)}\n")
@@ -448,30 +466,27 @@ def generate_graph_data(processed_xl_objects=None, feature_dict=None, pid=None, 
         processed_xl_objects = cross_link.get_upd_and_filter_processed_objects_pipeline()
     if cif_files is None:
         cif_files = general_utils.load_obj('cif_files')
-    data = []
+    if data is None:
+        data = []
     problems = [0, 0, 0, 0, 0]
     missing_samples = 0
-    # inter_pdbs = pdb_files_manager.get_inter_pdbs()
-    inter_pdbs = None
     # processed_xl_objects = pdb_files_manager.filter_objects_from_list_by_pdb(processed_xl_objects, inter_pdbs)
-    p = 0
     for i, xl_obj in enumerate(processed_xl_objects):
-        d = generate_single_xl_data(xl_obj, feature_dict, cif_files, problems, edge_dist_th, True, inter_pdbs)
-        # p += 1
-        # if p == 3:
-        #     exit(0)
+        d = generate_single_xl_data(xl_obj, feature_dict, cif_files, problems, edge_dist_th, True, inter_pdbs, predict)
         if d is not None:
             data.append(d)
         else:
             missing_samples += 1
     print(f"num of data: {len(data)}, missing samples: {missing_samples}\n")
     print(problems)
-    if pid is None:
-        general_utils.save_obj(data, data_name, dir_=ROOT_DATA_DIR)
-    else:
-        general_utils.save_obj(data, data_name + f"_{pid}",
-                               dir_=ROOT_DATA_DIR + 'parallel_output/')
+    if save:
+        if pid is None:
+            general_utils.save_obj(data, data_name, dir_=ROOT_DATA_DIR)
+        else:
+            general_utils.save_obj(data, data_name + f"_{pid}",
+                                   dir_=ROOT_DATA_DIR + 'parallel_output/')
     print("data saved")
+    return data
 
 
 def unit_data_pickle_files():
@@ -515,7 +530,7 @@ class XlGraphDataset(InMemoryDataset):
         super().__init__(root, transform, pre_transform, pre_filter)
         self.data, self.slices = torch.load(self.processed_paths[0])
         self.get_labels(cfg, th)
-        self.min_max_scaling_normalization()
+        self.min_max_scaling_normalization(cfg)
         self._num_classes = cfg['num_classes']
 
     @property
@@ -534,15 +549,21 @@ class XlGraphDataset(InMemoryDataset):
         self.data.y = torch.from_numpy(data_proccess.FeatDataset.get_labels_from_dist(np.asarray(self.data.y),
                                                                         cfg['num_classes'], th))
 
-    def min_max_scaling_normalization(self):
-        max_c = torch.max(self.data.x, dim=0).values
-        min_c = torch.min(self.data.x, dim=0).values
+    def min_max_scaling_normalization(self, cfg=None):
+        if cfg is None or cfg['data_type'] == 'Train':
+            max_c = torch.max(self.data.x, dim=0).values
+            min_c = torch.min(self.data.x, dim=0).values
+            max_linker = torch.max(self.data.linker)
+        else:
+            max_c = MAX_FEATURES
+            min_c = MIN_FEATURES
+            max_linker = MAX_LINKER_FEATURE
         for i in range(len(self.data.x[0])):
             self.data.x[:, i] = (self.data.x[:, i] - min_c[i]) / (max_c[i] - min_c[i])
 
         self.data.edge_attr = self.data.edge_attr + 1
         self.data.edge_attr = 1 / self.data.edge_attr
-        max_linker = torch.max(self.data.linker)
+
         self.data.linker = self.data.linker / max_linker
         # max_e = torch.max(self.data.edge_attr, dim=0).values
         # min_e = torch.min(self.data.edge_attr, dim=0).values
@@ -562,7 +583,7 @@ class XlGraphDataset(InMemoryDataset):
     def process(self):
         # Read data into huge `Data` list.
         data_list = general_utils.load_obj(self.dataset_name, ROOT_DATA_DIR)
-        data_list = self.clear_duplicates(data_list)
+        # data_list = self.clear_duplicates(data_list)
         if self.pre_filter is not None:
             data_list = [data for data in data_list if self.pre_filter(data)]
 
@@ -690,31 +711,41 @@ class XlPairGraphDataset(XlGraphDataset):
         if 'features' in cfg:
             keep_features = cfg['features']
             if 'mol2' not in keep_features:
-                self.data.x_a[MOL2_TYPE_START: MOL2_TYPE_END] = 0
-                self.data.x_b[MOL2_TYPE_START: MOL2_TYPE_END] = 0
+                self.data.x_a[:, MOL2_TYPE_START: MOL2_TYPE_END] = 0
+                self.data.x_b[:, MOL2_TYPE_START: MOL2_TYPE_END] = 0
             if 'charge' not in keep_features:
-                self.data.x_a[CHARGE_IDX] = 0
-                self.data.x_b[CHARGE_IDX] = 0
+                self.data.x_a[:, CHARGE_IDX] = 0
+                self.data.x_b[:, CHARGE_IDX] = 0
             if 'asa' not in keep_features:
-                self.data.x_a[ASA_IDX] = 0
-                self.data.x_b[ASA_IDX] = 0
+                self.data.x_a[:, ASA_IDX] = 0
+                self.data.x_b[:, ASA_IDX] = 0
             if 'radius' not in keep_features:
-                self.data.x_a[RADIUS_IDX] = 0
-                self.data.x_b[RADIUS_IDX] = 0
+                self.data.x_a[:, RADIUS_IDX] = 0
+                self.data.x_b[:, RADIUS_IDX] = 0
             if 'res_type' not in keep_features:
-                self.data.x_a[RESIDUE_TYPE_START: RESIDUE_TYPE_END] = 0
-                self.data.x_b[RESIDUE_TYPE_START: RESIDUE_TYPE_END] = 0
+                self.data.x_a[:, RESIDUE_TYPE_START: RESIDUE_TYPE_END] = 0
+                self.data.x_b[:, RESIDUE_TYPE_START: RESIDUE_TYPE_END] = 0
             if 'anchor' not in keep_features:
-                self.data.x_a[ANCHOR_DIST_IDX] = 0
-                self.data.x_b[ANCHOR_DIST_IDX] = 0
+                self.data.x_a[:, ANCHOR_DIST_IDX] = 0
+                self.data.x_b[:, ANCHOR_DIST_IDX] = 0
             if 'id' not in keep_features:
-                self.data.x_a[ID_ENCODING_START: ID_ENCODING_END] = 0
-                self.data.x_b[ID_ENCODING_START: ID_ENCODING_END] = 0
+                self.data.x_a[:, ID_ENCODING_START: ID_ENCODING_END] = 0
+                self.data.x_b[:, ID_ENCODING_START: ID_ENCODING_END] = 0
+            if 'edges' not in keep_features:
+                self.data.edge_attr_a[:] = 1
+                self.data.edge_attr_b[:] = 1
 
-    def min_max_scaling_normalization(self):
+    def min_max_scaling_normalization(self, cfg=None):
         x = torch.cat((self.data.x_a, self.data.x_b), dim=0)
-        max_c = torch.max(x, dim=0).values
-        min_c = torch.min(x, dim=0).values
+        if cfg is None or cfg['data_type'] == 'Train':
+            max_c = torch.max(x, dim=0).values
+            min_c = torch.min(x, dim=0).values
+            max_linker = torch.max(self.data.linker_size)
+        else:
+            max_c = MAX_FEATURES
+            min_c = MIN_FEATURES
+            max_linker = MAX_LINKER_FEATURE
+
         for i in range(len(x[0]) - 4):
             if max_c[i] == 0:
                 max_c[i] = 1
@@ -727,7 +758,6 @@ class XlPairGraphDataset(XlGraphDataset):
         self.data.edge_attr_b = self.data.edge_attr_b + 1
         self.data.edge_attr_b = 1 / self.data.edge_attr_b
 
-        max_linker = torch.max(self.data.linker_size)
         self.data.linker_size = self.data.linker_size / max_linker
 
         self.data.ca_error[self.data.ca_error == cross_link.INVALID_ERROR_VALUE] = cross_link.MEAN_PAE_ERROR
