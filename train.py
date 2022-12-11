@@ -30,6 +30,7 @@ import sys
 sys.path.insert(0, '/cs/labs/dina/seanco/xl_parser')
 import general_utils
 import cross_link
+import pdb_files_manager
 
 
 torch.multiprocessing.set_sharing_strategy('file_system')
@@ -51,13 +52,13 @@ def seed_everything(seed=3407):
         torch.backends.cudnn.benchmark = False
 
 
-def plot_cm(y_true, y_pred_prob):
+def plot_cm(y_true, y_pred_prob, title=''):
     y_pred_tags = np.argmax(y_pred_prob, axis=1).astype(np.int32)
     th = ['0 - 12', '12 - 20', '20 - 28', '28 - 45']
-    general_utils.plot_confusion_matrix(y_true.tolist(), y_pred_tags, th, title="Confusion Matrix (Validation Set)")
+    general_utils.plot_confusion_matrix(y_true.tolist(), y_pred_tags, th, title="Confusion Matrix (Test Set)")
     general_utils.plot_confusion_matrix(y_true.tolist(), y_pred_tags, th, normalize=True,
-                                        title="Normalized Confusion Matrix (Validation Set)")
-    plt.show()
+                                        title="Normalized Confusion Matrix (Test Set)")
+    # plt.show()
 
 
 def load_config(args=None, cfg_path='/cs/labs/dina/seanco/xl_mlp_nn/configs/gnn_separate_39f_angles.yaml'):
@@ -477,22 +478,6 @@ def train_epoch(model, train_loader, criterion, _optimizer, epoch, train_loss, w
             theta_labels.append(labels[3])
             phi_pred.append(outputs[4])
             phi_labels.append(outputs[4])
-        # if dist_in_wrong_pred is None:
-        #     dist_in_wrong_pred = wrong_dist
-        # else:
-        #     dist_in_wrong_pred = torch.cat((dist_in_wrong_pred, wrong_dist))
-        # if epoch == max_epoch:
-        #     if wrong_pred_feat is None:
-        #         wrong_pred_feat = inputs.y.to('cpu')[~correct_idx]
-        #     else:
-        #         wrong_pred_feat = torch.cat((wrong_pred_feat, inputs.y.to('cpu')[~correct_idx]), dim=0)
-        # accuracy += tmp_acc
-
-        # data_loader.set_postfix({'loss': cur_loss.item()})
-        # if (i + 1) % 20 == 0:
-        #     running_loss /= 20
-        #     print(f"[Train] Epoch: {epoch} Batch: {i+1} Loss: {running_loss:.3f}")
-        #     running_loss = 0.0
 
     if scheduler is not None:
         scheduler.step()
@@ -663,7 +648,7 @@ def load_data(cfg, train_data, eval_data=None, shuffle=True):
         train_inter_idx = list(set(inter_idx.tolist()).intersection(train_data.indices.tolist()))
         train_inter_idx = torch.tensor([(train_data.indices == i).nonzero(as_tuple=True)[0] for i in train_inter_idx])
         weights = torch.ones(len(train_data.indices))
-        weights[train_inter_idx] = 15
+        weights[train_inter_idx] = 10
         generator = torch.Generator().manual_seed(3407)
         train_sampler = WeightedRandomSampler(weights, len(weights), generator=generator)
         shuffle = False
@@ -713,7 +698,8 @@ def get_labels_th(cfg):
             th = random.choice([[12, 18], [13, 18], [13, 20], [12, 20], [13, 21]])
         elif n_classes == 4:
             # th = random.choice([[12, 18, 22], [11, 17, 20], [11, 16, 21], [10, 17, 23], [13, 19, 23]])
-            th = [11.98239517, 16.39906025, 22.83931446]
+            # th = [11.98239517, 16.39906025, 22.83931446]
+            th = [12.05986881, 16.56343269, 23.54780769]
         elif n_classes == 5:
             # th = random.choice([[10, 14, 18, 22], [11, 17, 21, 25], [11, 14, 17, 22],
             #                      [10, 15, 18, 23], [10, 14, 19, 23]])
@@ -786,7 +772,7 @@ def get_dataset(cfg, wandb_=None):
         else:
             train_data, eval_data, test_data = split_dataset(cfg, data, 0.1, 0.1)
         if cfg['data_type'] == 'test':
-            return test_data
+            return train_data, test_data
         elif cfg['data_type'] == 'predict':
             return eval_data, eval_data
     elif cfg['dataset'] == "linker_as_label":
@@ -882,12 +868,12 @@ def log_results(cfg, wandb_, confusion_matrix, predicted_probabilities, true_lab
             probas = np.concatenate((prob_complete, reshaped_probas), axis=1)
         elif cfg['loss_type'] != 'corn':
             probas = np.reshape(predicted_probabilities, (true_labels.shape[0], out_size))
-        th = list(cfg['distance_th_classification'])
-        if th is None or th == 'None':
-            th = [11.897181510925293, 16.312454223632812, 22.885560989379883]
-        th.append(45)
-        th.insert(0, 0)
-        th = [(round(th_i, 1)) for th_i in th]
+        # th = list(cfg['distance_th_classification'])
+        # if th is None or th == 'None' or th == 'manual':
+        th = [0, 12, 16.5, 23.5, 45]
+        # th.append(45)
+        # th.insert(0, 0)
+        # th = [(round(th_i, 1)) for th_i in th]
         class_names = [f"{th[j]}-{th[j + 1]}" for j in range(len(th) - 1)]
         if cfg['loss_type'] != 'corn':
             wandb_.log({f"{title}roc": wandb.plot.roc_curve(true_labels, probas, classes_to_plot=0, title=f"{title}ROC")})
@@ -902,15 +888,40 @@ def log_results(cfg, wandb_, confusion_matrix, predicted_probabilities, true_lab
         wandb_.log({f"{title}recall": recall})
         wandb_.log({f"{title}precision": precision})
         wandb_.log({f"{title}auc": auc_roc})
-        fig = general_utils.plot_roc(true_labels, probas, "ROC curve", cfg['num_classes'])
+        fig = general_utils.plot_roc(true_labels, probas, "Class-Wise ROC Curves (Test Set)",
+                                     cfg['num_classes'], class_names)
+        out_probs_file = f"/cs/labs/dina/seanco/xl_mlp_nn/models/outputs/probas_{cfg['name'].split('-')[-1]}.npy"
+        out_label_file = f"/cs/labs/dina/seanco/xl_mlp_nn/models/outputs/labels_{cfg['name'].split('-')[-1]}.npy"
+        with open(out_probs_file, 'wb') as f:
+            np.save(f, probas)
+        with open(out_label_file, 'wb') as f:
+            np.save(f, true_labels)
         wandb_.log({f"{title}roc_plot_multiclass": fig})
-        # plot_cm(true_labels, probas)
+        plot_cm(true_labels, probas)
+
+
+def load_model(cfg, model, _optimizer, wandb_=None):
+    if cfg['exist_model'].split('_')[-1] == 'scaled':
+        model = temperature_scaling.ModelWithTemperature(model)
+        model.to(device)
+    checkpoint = torch.load(f"/cs/labs/dina/seanco/xl_mlp_nn/models/{cfg['exist_model']}")
+    # model.load_state_dict(checkpoint)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    _optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    initial_epoch = checkpoint['epoch']
+    if cfg['data_type'] != 'Train' or cfg['fine_tune']:
+        initial_epoch = 0
+    loss = checkpoint['loss']
+    if cfg['calibrate_model'] == 'start':
+        return temperature_scaling_calibration(model, cfg, wandb_, initial_epoch, _optimizer, loss), initial_epoch
+    return model, initial_epoch
 
 
 def train(cfg=None, i=0, wandb_=None):
     if wandb_ is None:
         wandb_ = wandb.init(project="xl_gnn", entity="seanco", config=cfg)
     print(cfg, flush=True)
+    print("name: ", wandb_.name)
     if cfg['num_classes'] == 2:
         out_size = 1
     else:
@@ -926,21 +937,8 @@ def train(cfg=None, i=0, wandb_=None):
     _optimizer = construct_optimizer(model.parameters(), cfg)
     scheduler = get_scheduler(cfg, _optimizer)
     initial_epoch = 0
-    if 'exist_model' in cfg and cfg['exist_model'] is not None:
-        if cfg['exist_model'].split('_')[-1] == 'scaled':
-            model = temperature_scaling.ModelWithTemperature(model)
-            model.to(device)
-        checkpoint = torch.load(f"/cs/labs/dina/seanco/xl_mlp_nn/models/{cfg['exist_model']}")
-        # model.load_state_dict(checkpoint)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        _optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        initial_epoch = checkpoint['epoch']
-        if cfg['data_type'] != 'Train' or cfg['fine_tune']:
-            initial_epoch = 0
-        loss = checkpoint['loss']
-        if cfg['calibrate_model'] == 'start':
-            return temperature_scaling_calibration(model, cfg, wandb_, initial_epoch, _optimizer, loss)
-            # return temperature_scaling_calibration(model, cfg, wandb_, initial_epoch, _optimizer, 1)
+    if 'exist_model' in cfg and cfg['exist_model'] is not None and cfg['exist_model'] != 'None':
+        model, initial_epoch = load_model(cfg, model, _optimizer, wandb_)
     train_loss, val_loss, eval_accuracy, train_accuracy, per_class_acc = list(), list(), list(), list(), list()
     train_data, eval_data = get_dataset(cfg, wandb_)
     # graph_dataset.test_pair_graph_dataloader(train_data)
@@ -973,15 +971,21 @@ def train(cfg=None, i=0, wandb_=None):
     log_results(cfg, wandb_, confusion_matrix, predicted_probabilities, true_labels, i, out_size)
     if cfg['xl_type_feature']:
         stats_of_inter_xl_performance(model, eval_data, criterion, wandb_, cfg, i, out_size)
-    if cfg['name'] != 'None':
+    if cfg['name'] != 'None' and cfg['data_type'] == 'Train':
         if cfg['calibrate_model'] == 'end':
             temperature_scaling_calibration(model, cfg, wandb_, epoch, _optimizer, train_loss[-1], val_loader,
                                             criterion[0])
         else:
+            save_name = f"models/{cfg['name']}"
+            if cfg['name'] == 'sweep':
+                save_name = f"models/{wandb_.name}"
             print("saving model")
             torch.save({'epoch': epoch, 'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': _optimizer.state_dict(), 'loss': train_loss[-1]},
-                       f"models/{cfg['name']}")
+                        'optimizer_state_dict': _optimizer.state_dict(), 'loss': train_loss[-1]}, save_name)
+    elif cfg['name'] != 'None' and cfg['data_type'] == 'test':
+        if cfg['calibrate_model'] == 'end':
+            temperature_scaling_calibration(model, cfg, wandb_, epoch, _optimizer, 1.0, val_loader,
+                                            criterion[0])
 
 
 def parameters_tune(args, cfg=None, sweeps=False):
@@ -1077,14 +1081,17 @@ def train_with_sweeps():
 
 def run_with_sweeps(config):
     wandb.login()
-    # sweep_id = wandb.sweep(config, entity='seanco', project='xl_gnn')
-    # wandb.agent(sweep_id, project='xl_gnn', entity='seanco', function=train_with_sweeps)
-    wandb.agent('gfu40i73', project='xl_gnn', entity='seanco', function=train_with_sweeps)
+    sweep_id = wandb.sweep(config, entity='seanco', project='xl_gnn')
+    wandb.agent(sweep_id, project='xl_gnn', entity='seanco', function=train_with_sweeps)
+    # wandb.agent('gfu40i73', project='xl_gnn', entity='seanco', function=train_with_sweeps)
 
 
 if __name__ == "__main__":
-    xl_objects = cross_link.get_upd_and_filter_processed_objects_pipeline('processed_xl_objects_intra_lys')
-    graph_dataset.generate_graph_data(xl_objects, data_name='44f_3A_intra_lys_dataset', edge_dist_th=3)
+    # feat_dict = general_utils.load_obj(pdb_files_manager.XL_NEIGHBORS_FEATURE_DICT_INTER_INTRA_LYS)
+    # xl_objects = cross_link.get_upd_and_filter_processed_objects_pipeline()
+    # inter_pdbs = pdb_files_manager.get_inter_pdbs()
+    # graph_dataset.generate_graph_data(xl_objects, feature_dict=feat_dict, data_name='filtered_pdbs_44f_3A_inter_intra_lys_af_dataset',
+    #                                   edge_dist_th=3, inter_pdbs=inter_pdbs, save=True)
     print("Start main\n", flush=True)
     seed_everything()
     args = parse_args()

@@ -301,6 +301,11 @@ class CustomGAT(torch.nn.Module):
         self.pre_lin2 = torch.nn.Linear(self.nhid, self.nhid)
         if n_heads % self.nhid != 0:
             n_heads = 8
+        # self.convs.append(GCNConv(self.nhid, self.nhid, add_self_loops=False, improved=True))
+        # self.convs.append(GATv2Conv(self.nhid, self.nhid // n_heads, heads=n_heads, dropout=attn_dropout, edge_dim=1,
+        #                             add_self_loops=False))
+        # self.convs.append(GATv2Conv(self.nhid, self.nhid // n_heads, heads=n_heads, dropout=attn_dropout, edge_dim=1,
+        #                             add_self_loops=False))
         for i in range(n_layers):
             self.convs.append(GATv2Conv(self.nhid, self.nhid // n_heads, heads=n_heads, dropout=attn_dropout, edge_dim=1,
                                         add_self_loops=False))
