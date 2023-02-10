@@ -5,7 +5,7 @@ import matplotlib
 import torch
 import os
 import gc
-
+import copy
 import torch_geometric
 import yaml
 import mlp
@@ -27,18 +27,40 @@ import gnn
 import wandb
 import temperature_scaling
 import sys
+from torch_geometric.explain import Explainer, GNNExplainer, Explanation
 sys.path.insert(0, '/cs/labs/dina/seanco/xl_parser')
 import general_utils
 import cross_link
 import pdb_files_manager
 
 
-torch.multiprocessing.set_sharing_strategy('file_system')
+# torch.multiprocessing.set_sharing_strategy('file_system')
 # matplotlib.use('Agg')
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(device)
 # device = "cpu"
+
+
+class EarlyStopper:
+    def __init__(self, patience=5, min_delta=0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.min_validation_loss = np.inf
+        self.best_model = None
+
+    def early_stop(self, validation_loss, model):
+        if validation_loss < self.min_validation_loss:
+            self.min_validation_loss = validation_loss
+            self.counter = 0
+            self.best_model = copy.deepcopy(model)
+            self.best_model.to('cpu')
+        elif validation_loss > (self.min_validation_loss + self.min_delta):
+            self.counter += 1
+            if self.counter >= self.patience:
+                return True
+        return False
 
 
 def seed_everything(seed=3407):
@@ -52,13 +74,16 @@ def seed_everything(seed=3407):
         torch.backends.cudnn.benchmark = False
 
 
-def plot_cm(y_true, y_pred_prob, title=''):
-    y_pred_tags = np.argmax(y_pred_prob, axis=1).astype(np.int32)
-    th = ['0 - 12', '12 - 20', '20 - 28', '28 - 45']
-    general_utils.plot_confusion_matrix(y_true.tolist(), y_pred_tags, th, title="Confusion Matrix (Test Set)")
-    general_utils.plot_confusion_matrix(y_true.tolist(), y_pred_tags, th, normalize=True,
-                                        title="Normalized Confusion Matrix (Test Set)")
-    # plt.show()
+def plot_cm(y_true, y_pred_prob, title='', class_names=None):
+    try:
+        y_pred_tags = np.argmax(y_pred_prob, axis=1).astype(np.int32)
+        # class_names = ['0 - 12', '12 - 20', '20 - 28', '28 - 45']
+        general_utils.plot_confusion_matrix(y_true.tolist(), y_pred_tags, class_names, title="Confusion Matrix (Test Set)")
+        general_utils.plot_confusion_matrix(y_true.tolist(), y_pred_tags, class_names, normalize=True,
+                                            title="Normalized Confusion Matrix (Test Set)")
+        # plt.show()
+    except Exception as e:
+        print(e)
 
 
 def load_config(args=None, cfg_path='/cs/labs/dina/seanco/xl_mlp_nn/configs/gnn_separate_39f_angles.yaml'):
@@ -340,7 +365,7 @@ def record_losses(losses, wandb_, len_data, epoch, phase):
 
 
 def eval_epoch(model, val_loader, criterion, epoch, val_loss, wandb_, is_regression, n_classes, acc,
-               max_epoch, cfg, is_gnn=True, temp_scaling=False, record_in_wandb=True):
+               max_epoch, cfg, is_gnn=True, temp_scaling=False, record_in_wandb=True, early_stop=True):
     is_connected = cfg['is_connected']
     is_ca = 'ca_pred' not in cfg or cfg['ca_pred']
     is_cb = cfg['cb_pred']
@@ -399,7 +424,7 @@ def eval_epoch(model, val_loader, criterion, epoch, val_loss, wandb_, is_regress
                                {ii: ac for ii, ac in enumerate(per_class_acc)}})
                 print(confusion_matrix)
                 print('per class acc: ', per_class_acc)
-                if epoch == max_epoch:
+                if epoch == max_epoch or early_stop:
                     if not temp_scaling:
                         predicted_probabilities = np.asarray(y_prob.to('cpu', non_blocking=True)).flatten()
                         true_labels = np.asarray(torch.cat(ca_labels, dim=0).int().to('cpu')).flatten()
@@ -656,35 +681,39 @@ def load_data(cfg, train_data, eval_data=None, shuffle=True):
         num_workers = 1
     else:
         num_workers = len(os.sched_getaffinity(0)) - 1
+    pin_memory = True
+    if cfg['data_type'] != 'Train':
+        pin_memory = False
+        num_workers = 0
     # num_workers = 1
     if cfg['model_type'] == 'gnn':
         if cfg['is_connected']:
             train_loader = PyG_DataLoader(train_data, cfg['batch_size'], shuffle=shuffle,
-                                          num_workers=num_workers, pin_memory=True, sampler=None)
+                                          num_workers=num_workers, pin_memory=pin_memory, sampler=None)
             if eval_data is not None:
                 val_loader = PyG_DataLoader(eval_data, cfg['batch_size'], shuffle=shuffle,
-                                            num_workers=num_workers, pin_memory=True)
+                                            num_workers=num_workers, pin_memory=pin_memory)
         else:
             if torch.cuda.device_count() > 1 and cfg['multi_gpu'] and eval_data is not None:
                 train_loader = PyG_ListLoader(train_data, cfg['batch_size'], shuffle=shuffle,
                                               num_workers=num_workers,
-                                              pin_memory=True, sampler=train_sampler)
+                                              pin_memory=pin_memory, sampler=train_sampler)
                 val_loader = PyG_ListLoader(eval_data, cfg['batch_size'], shuffle=shuffle,
                                             num_workers=num_workers,
-                                            pin_memory=True)
+                                            pin_memory=pin_memory)
             else:
                 train_loader = PyG_DataLoader(train_data, cfg['batch_size'], shuffle=shuffle,
                                               num_workers=num_workers, follow_batch=['x_a', 'x_b'],
-                                              pin_memory=True, sampler=train_sampler)
+                                              pin_memory=pin_memory, sampler=train_sampler)
                 if eval_data is not None:
                     val_loader = PyG_DataLoader(eval_data, cfg['batch_size'], shuffle=shuffle,
                                                 num_workers=num_workers, follow_batch=['x_a', 'x_b'],
-                                                pin_memory=True)
+                                                pin_memory=pin_memory)
     else:
         train_loader = DataLoader(train_data, batch_size=cfg['batch_size'], shuffle=shuffle,
-                                  num_workers=num_workers, pin_memory=True)
+                                  num_workers=num_workers, pin_memory=pin_memory)
         val_loader = DataLoader(eval_data, batch_size=cfg['batch_size'], shuffle=shuffle,
-                                num_workers=num_workers, pin_memory=True)
+                                num_workers=num_workers, pin_memory=pin_memory)
     return train_loader, val_loader
 
 
@@ -701,18 +730,16 @@ def get_labels_th(cfg):
             # th = [11.98239517, 16.39906025, 22.83931446]
             th = [12.05986881, 16.56343269, 23.54780769]
         elif n_classes == 5:
-            # th = random.choice([[10, 14, 18, 22], [11, 17, 21, 25], [11, 14, 17, 22],
-            #                      [10, 15, 18, 23], [10, 14, 19, 23]])
-            th = [8, 12, 16, 30]
+            th = [6, 9, 12, 15]
         elif n_classes == 6:
-            th = [8, 12, 18, 25, 32]
+            th = [6, 9, 12, 15, 18]
         elif n_classes == 7:
             th = random.choice([[9, 13, 15, 17, 20, 25], [11, 15, 17, 19, 21, 25], [9, 12, 14, 16, 18, 22],
                                  [10, 13, 17, 20, 23, 28], [12, 17, 19, 21, 25, 29]])
-        elif n_classes == 18:
-            th = [6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38]
+        elif n_classes == 21:
+            th = [4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 42]
         elif n_classes == 12:
-            th = [7, 10, 13, 16, 19, 22, 25, 28, 31, 34, 37]
+            th = [6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 36]
         else:
             th = random.sample(range(8, 32), n_classes)
             th.sort()
@@ -842,7 +869,10 @@ def fine_tune_model(model):
 
 def stats_of_inter_xl_performance(model, eval_data, criterion, wandb_, cfg, i, out_size):
     inter_idx = (eval_data.dataset.data.xl_type.T[0] == 0).nonzero(as_tuple=True)[0]
-    val_inter_idx = list(set(inter_idx.tolist()).intersection(eval_data.indices.tolist()))
+    if cfg['xl_type_feature']:
+        val_inter_idx = list(set(inter_idx.tolist()).intersection(eval_data.indices.tolist()))
+    else:
+        val_inter_idx = list(set(inter_idx.tolist()).intersection(eval_data.indices))
     val_inter_data = torch.utils.data.Subset(eval_data.dataset, val_inter_idx)
     data_loader, _ = load_data(cfg, val_inter_data, val_inter_data)
     val_loss, eval_accuracy = list(), list()
@@ -874,7 +904,8 @@ def log_results(cfg, wandb_, confusion_matrix, predicted_probabilities, true_lab
         # th.append(45)
         # th.insert(0, 0)
         # th = [(round(th_i, 1)) for th_i in th]
-        class_names = [f"{th[j]}-{th[j + 1]}" for j in range(len(th) - 1)]
+        # class_names = [f"{th[j]}-{th[j + 1]}" for j in range(len(th) - 1)]
+        class_names = range(cfg['num_classes'])
         if cfg['loss_type'] != 'corn':
             wandb_.log({f"{title}roc": wandb.plot.roc_curve(true_labels, probas, classes_to_plot=0, title=f"{title}ROC")})
             cm = wandb.plot.confusion_matrix(y_true=true_labels.tolist(), probs=probas,
@@ -896,17 +927,22 @@ def log_results(cfg, wandb_, confusion_matrix, predicted_probabilities, true_lab
             np.save(f, probas)
         with open(out_label_file, 'wb') as f:
             np.save(f, true_labels)
-        wandb_.log({f"{title}roc_plot_multiclass": fig})
-        plot_cm(true_labels, probas)
+        if fig is not None:
+            wandb_.log({f"{title}roc_plot_multiclass": fig})
+        # plot_cm(true_labels, probas, class_names=class_names)
+        general_utils.plot_single_prediction_distribution(probas, true_labels)
 
 
-def load_model(cfg, model, _optimizer, wandb_=None):
+def load_model(cfg, model, _optimizer, wandb_=None, is_cpu=False):
     if cfg['exist_model'].split('_')[-1] == 'scaled':
         model = temperature_scaling.ModelWithTemperature(model)
         model.to(device)
-    checkpoint = torch.load(f"/cs/labs/dina/seanco/xl_mlp_nn/models/{cfg['exist_model']}")
+    checkpoint = torch.load(f"/cs/labs/dina/seanco/xl_mlp_nn/models/{cfg['exist_model']}", map_location=torch.device('cpu'))
     # model.load_state_dict(checkpoint)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    if is_cpu:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model.load_state_dict(checkpoint['model_state_dict'])
     _optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     initial_epoch = checkpoint['epoch']
     if cfg['data_type'] != 'Train' or cfg['fine_tune']:
@@ -942,11 +978,11 @@ def train(cfg=None, i=0, wandb_=None):
     train_loss, val_loss, eval_accuracy, train_accuracy, per_class_acc = list(), list(), list(), list(), list()
     train_data, eval_data = get_dataset(cfg, wandb_)
     # graph_dataset.test_pair_graph_dataloader(train_data)
+    # graph_dataset.analyze_res_type(train_data, cfg['num_classes'])
     criterion, is_regression = get_criterion(cfg, train_data)
     train_loader, val_loader = load_data(cfg, train_data, eval_data)
-    # writer = SummaryWriter()
     epochs = cfg['epochs']
-    # update_loss_weights(cfg)
+    early_stopper = EarlyStopper(patience=cfg['early_stop_patience'], min_delta=0)
     for epoch in range(initial_epoch, epochs):
         try:
             if cfg['data_type'] == 'Train':
@@ -958,7 +994,10 @@ def train(cfg=None, i=0, wandb_=None):
             per_class_acc, predicted_probabilities, true_labels, confusion_matrix = eval_epoch(model,
                                     val_loader, criterion, epoch, val_loss, wandb_,
                                     is_regression, cfg['num_classes'], eval_accuracy,
-                                    cfg['epochs'] - 1, cfg)
+                                    cfg['epochs'] - 1, cfg, early_stop=cfg['early_stopping'])
+            if cfg['early_stopping']:
+                if early_stopper.early_stop(val_loss[-1], model):
+                    break
 
         except Exception as e:
             print(e)
@@ -967,9 +1006,41 @@ def train(cfg=None, i=0, wandb_=None):
             print(e)
             raise e
 
+    # ex = Explainer(
+    #     model=model,
+    #     algorithm=GNNExplainer(epochs=100),
+    #     explanation_type='model',
+    #     node_mask_type='common_attributes',
+    #     edge_mask_type=None,
+    #     model_config=dict(
+    #         mode='multiclass_classification',
+    #         task_level='graph',
+    #         return_type='log_probs',
+    #     ),
+    # )
+    #
+    # node_index = None
+    # explanations = []
+    # datas = list(iter(train_loader))
+    # for i, d in enumerate(datas):
+    #     data = d.to(device)
+    #     # explanations.append(ex(data, data.edge_index_a, index=node_index, target=data.y_ca))
+    #     explanations.append(ex(data, data.edge_index_a, index=node_index))
+    #     # if i > 100:
+    #     #     break
+    # # print(f'Generated explanations in {explanation.available_explanations}')
+    # # if explanation.validate():
+    # path = 'model_feature_importance.png'
+    # Explanation.visualize_avg_feat_importance(explanations, path=path)
+    # print(f"Feature importance plot has been saved to '{path}'")
+
+        # path = 'subgraph.pdf'
+        # explanation.visualize_graph(path)
+        # print(f"Subgraph visualization plot has been saved to '{path}'")
+
     print("Finished Training")
     log_results(cfg, wandb_, confusion_matrix, predicted_probabilities, true_labels, i, out_size)
-    if cfg['xl_type_feature']:
+    if cfg['xl_type_feature'] or cfg['log_inter_perf']:
         stats_of_inter_xl_performance(model, eval_data, criterion, wandb_, cfg, i, out_size)
     if cfg['name'] != 'None' and cfg['data_type'] == 'Train':
         if cfg['calibrate_model'] == 'end':
@@ -980,6 +1051,10 @@ def train(cfg=None, i=0, wandb_=None):
             if cfg['name'] == 'sweep':
                 save_name = f"models/{wandb_.name}"
             print("saving model")
+            if cfg['early_stopping']:
+                model = early_stopper.best_model
+            else:
+                model.to('cpu')
             torch.save({'epoch': epoch, 'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': _optimizer.state_dict(), 'loss': train_loss[-1]}, save_name)
     elif cfg['name'] != 'None' and cfg['data_type'] == 'test':
@@ -995,32 +1070,7 @@ def parameters_tune(args, cfg=None, sweeps=False):
         cfg = load_config(args)
     if sweeps:
         return run_with_sweeps(cfg)
-        # return train_with_sweeps()
-    if not cfg['hparam_tune']:
-        return train(cfg=cfg)
-    lrs = [0.0005, 0.0001]
-    # schedulers = ['steps', None]
-    # batch_sizes = [32, 64]
-    l1s = [256, 512]
-    l2s = [256, 128, 64, 32]
-    l3s = [128, 64, 32, 16, 8, 4]
-    thresholds = [18, 20]
-    hidden_layers = [3, 4]
-
-    # for opt in optimizers:
-    for lr in lrs:
-        # for th in thresholds:
-        for l1 in l1s:
-            for l2 in l2s:
-                for l3 in l3s:
-                    layers = [l1, l2, l3]
-
-                    cfg['base_lr'] = lr
-                    cfg['layers'] = layers
-                    print('train with params: opt, lr, drop, class_th: ', lr)
-                    wandb_run = wandb.init(reinit=True, project="xl_gnn", entity="seanco", config=cfg)
-                    train(None, args=args, cfg=cfg, i=i, wandb_=wandb_run)
-                    i += 1
+    return train(cfg, i)
 
 
 def parse_args():
@@ -1038,9 +1088,11 @@ class TrainingParser(argparse.ArgumentParser):
             "--cfg",
             dest="cfg_file",
             help="Path to the config file",
-            default="/cs/labs/dina/seanco/xl_mlp_nn/configs/gnn_separate_44f_3a.yaml",
+            # default="/cs/labs/dina/seanco/xl_mlp_nn/configs/gnn_separate_44f_3a.yaml",
             # default="/cs/labs/dina/seanco/xl_mlp_nn/configs/eval_inter_44f_3a.yaml",
             # default="/cs/labs/dina/seanco/xl_mlp_nn/configs/debug_config.yaml",
+            default="/cs/labs/dina/seanco/xl_mlp_nn/configs/gnn_47f.yaml",
+            # default="/cs/labs/dina/seanco/xl_mlp_nn/configs/eval_gnn_by_name.yaml",
             # default="/cs/labs/dina/seanco/xl_mlp_nn/configs/sweep_gat_44.yaml",
             type=str,
         )
@@ -1053,6 +1105,24 @@ class TrainingParser(argparse.ArgumentParser):
             "--epochs",
             help="Number of epochs",
             type=int
+        )
+        self.add_argument(
+            "--create_dataset",
+            help="If True, runs creation of new dataset",
+            default=False,
+            type=bool
+        )
+        self.add_argument(
+            "--xl_objects_file",
+            help="If not None, load objects from this pickle",
+            default='',
+            type=str
+        )
+        self.add_argument(
+            "--dataset_name",
+            help="Name of the new dataset - in case create_dataset is True",
+            default='47f_dataset',
+            type=str
         )
 
     @staticmethod
@@ -1067,14 +1137,9 @@ class TrainingParser(argparse.ArgumentParser):
 
 
 def train_with_sweeps():
-    # cfg = load_config(None)
-    # with wandb.init(config=cfg, project='xl_gnn', entity='seanco') as wandb_:
     with wandb.init() as wandb_:
         config = wandb_.config
         print(config)
-        # cfg_file_path = open('/cs/labs/dina/seanco/xl_mlp_nn/configs/gnn_separate_39f_angles.yaml', 'r')
-        # cfg = yaml.safe_load(cfg_file_path)
-        # cfg = upd_cfg_by_sweeps(cfg, config)
         train(config, wandb_=wandb_)
     gc.collect()
 
@@ -1087,12 +1152,21 @@ def run_with_sweeps(config):
 
 
 if __name__ == "__main__":
-    # feat_dict = general_utils.load_obj(pdb_files_manager.XL_NEIGHBORS_FEATURE_DICT_INTER_INTRA_LYS)
-    # xl_objects = cross_link.get_upd_and_filter_processed_objects_pipeline()
-    # inter_pdbs = pdb_files_manager.get_inter_pdbs()
-    # graph_dataset.generate_graph_data(xl_objects, feature_dict=feat_dict, data_name='filtered_pdbs_44f_3A_inter_intra_lys_af_dataset',
-    #                                   edge_dist_th=3, inter_pdbs=inter_pdbs, save=True)
+    # processed_xl_objects = cross_link.get_upd_and_filter_processed_objects_pipeline()
+    # cross_link.CrossLink.create_closest_residues_dict(processed_xl_objects)
+    # cross_link.CrossLink.create_mutation_pdbs()
+    # exit(0)
     print("Start main\n", flush=True)
     seed_everything()
     args = parse_args()
-    parameters_tune(args, None, False)
+    if args.create_dataset:
+        feat_dict = general_utils.load_obj(pdb_files_manager.XL_NEIGHBORS_FEATURE_DICT_INTER_INTRA_LYS)
+        if args.xl_objects_path != '':
+            xl_objects = general_utils.load_obj(args.xl_objects_file)
+        else:
+            xl_objects = cross_link.get_upd_and_filter_processed_objects_pipeline()
+        inter_pdbs = pdb_files_manager.get_inter_pdbs()
+        graph_dataset.generate_graph_data(xl_objects, feature_dict=feat_dict, data_name=args.dataset_name,
+                                          edge_dist_th=3, inter_pdbs=inter_pdbs, save=True)
+    else:
+        parameters_tune(args, None, False)

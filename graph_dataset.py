@@ -31,7 +31,7 @@ NOT_CONNECTED_18F_DATASET = "onehot_graph_dataset"
 SEPARATE_18F_DATASET = "separate_graphs_18f_1t_dataset"
 SEPARATE_39F_ANGLES_DATASET = "separate_graphs_39f_12t_dataset"
 AA_DICT = {0: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 6, 8: 7, 10: 8, 11: 9, 12: 10, 13: 11, 15: 12, 16: 13,
-           17: 14, 18: 15, 19: 16, 21: 17, 22: 18, 23: 19, 24: 20}
+           17: 14, 18: 15, 19: 16, 21: 17, 22: 18, 23: 19, 24: 20, 14: 21, 20: 22}
 Y_DISTANCES = 0
 Y_OMEGA = 1
 OMEGA_SIZE = 2
@@ -55,24 +55,27 @@ RADIUS_IDX = 17
 CHARGE_IDX = 15
 ASA_IDX = 16
 RESIDUE_TYPE_START = 18
-RESIDUE_TYPE_END = 39
-ANCHOR_DIST_IDX = 39
-ID_ENCODING_START = 40
-ID_ENCODING_END = 44
+RESIDUE_TYPE_END = 41
+ANCHOR_DIST_IDX = 41
+ANCHOR_CB_DIST_IDX = 42
+ID_ENCODING_START = 43
+ID_ENCODING_END = 47
 MAX_FEATURES = torch.tensor([ 1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,
                         1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.1100,
                         44.2074,  2.2650,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,
                         1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,
-                        1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000, 16.4794,
-                        1.0000,  1.0000,  1.0000,  1.0000], dtype=torch.float64)
+                        1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  0.0000,
+                        1.0000, 15.0000, 17.5540,  1.0000,  1.0000,  1.0000,  1.0000], dtype=torch.float64)
 MIN_FEATURES = torch.tensor([ 0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,
-                        0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000, -0.7200,
-                        0.0000,  1.4300,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,
-                        0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,
-                        0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,
-                        0.0500,  0.0722,  0.0411,  0.0315], dtype=torch.float64)
+                              0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000, -0.7200,
+                              0.0000,  1.4300,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,
+                              0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,
+                              0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,
+                              0.0000,  0.0000,  0.0000,  0.0500,  0.0722,  0.0411,  0.0315], dtype=torch.float64)
 MAX_LINKER_FEATURE = torch.tensor(34.4000)
 
+# MOL2_TYPE {C2 = 0, C3 =1 , Car = 2, Ccat = 3, N2 = 4, N4 = 5, Nam = 6,
+#            Nar = 7, Npl3 = 8, O2 = 9, O3 = 10, Oco2 = 11, P3 = 12, S3 = 13, UNK_MOL2_TYPE = 14 };
 
 class ImbalancedDatasetSampler(Sampler):
     """Samples elements randomly from a given list of indices for imbalanced dataset
@@ -171,6 +174,18 @@ class TwoGraphsData(Data):
             return super().__inc__(key, value, *args, **kwargs)
 
 
+def analyze_res_type(data, n_classes=4):
+    classes = [[] for i in range(n_classes)]
+    for d in data:
+        target = d.y_ca
+        classes[target.item()].append(torch.argmax(d.x_a[:, RESIDUE_TYPE_START: RESIDUE_TYPE_END], dim=1))
+        classes[target.item()].append(torch.argmax(d.x_b[:, RESIDUE_TYPE_START: RESIDUE_TYPE_END], dim=1))
+
+    for c in classes:
+        h = torch.cat(c, dim=0)
+        general_utils.plot_histogram([h.numpy()], "")
+
+
 def calc_node_degrees(G):
     degree_sequence = sorted((d for n, d in G.degree()), reverse=True)
     dmax = max(degree_sequence)
@@ -232,9 +247,9 @@ def avg_degree_all_data(edge_th=3):
 
         # uni_a, uni_b = obj.uniport_a.split('-')[0].split('.')[0], obj.uniport_b.split('-')[0].split('.')[0]
         # if uni_a not in feat_dict or uni_b not in feat_dict:
-        file_name = pdb_files_manager.find_pdb_file_from_xl_obj(obj, cif_files)
+        file_name = obj.pdb_path
         uni_a = uni_b = file_name.split('/')[-1].split('.')[0]
-        if obj.uniport_a != obj.uniport_b or uni_a not in feat_dict:
+        if obj.chain_a != obj.chain_b or uni_a not in feat_dict:
             print(f"Problem type 0 with: {uni_a}, {uni_b}")
             return None
         uniport_feat_dict_a = feat_dict[uni_a]
@@ -343,6 +358,16 @@ def crate_edge_index(features, start_idx=0, distances=None, edge_th=3):
     return torch.as_tensor(edges, dtype=torch.long)
 
 
+def add_cb_anchor_to_feat(features, dist):
+    """
+    Add anchor - distance from each node to the Cb node, to get more information about node positions
+    """
+    n = len(features)
+    ca_dist = torch.from_numpy(dist[n:2*n]).resize(n, 1)
+    features = torch.cat((features, ca_dist), dim=1)
+    return features
+
+
 def add_ca_anchor_to_feat(features, dist):
     """
     Add anchor - distance from each node to the Ca node, to get more information about node positions
@@ -369,7 +394,7 @@ def res_type_to_onehot(features):
     input_ = features[:, -1].to(torch.long)
     try:
         input_.apply_(AA_DICT.get)
-        one = F.one_hot(input_, num_classes=21)
+        one = F.one_hot(input_, num_classes=23)
         features = torch.cat((features[:, :-1], one), dim=1)
         return features
     except Exception as e:
@@ -386,7 +411,7 @@ def mol2_type_to_onehot(features):
 
 
 def add_xl_type_feature(obj):
-    if obj.uniport_a == obj.uniport_b:
+    if obj.chain_a == obj.chain_b:
         feat = torch.zeros(1, dtype=torch.long)
     else:
         feat = torch.ones(1, dtype=torch.long)
@@ -430,7 +455,9 @@ def generate_single_xl_data(obj, feat_dict, cif_files, problems, edge_dist_th=5,
         edges_a, edge_attr_a = add_self_loops(edges_a.t().contiguous(), edge_attr_a, 0)
         edges_b, edge_attr_b = add_self_loops(edges_b.t().contiguous(), edge_attr_b, 0)
         res_a_feat = add_ca_anchor_to_feat(res_a_feat, dist_a)
+        res_a_feat = add_cb_anchor_to_feat(res_a_feat, dist_a)
         res_b_feat = add_ca_anchor_to_feat(res_b_feat, dist_b)
+        res_b_feat = add_cb_anchor_to_feat(res_b_feat, dist_b)
         res_a_feat = add_id_encoding(res_a_feat, edges_a)
         res_b_feat = add_id_encoding(res_b_feat, edges_b)
         ca, cb, omega, theta, phi = create_targets(obj)
@@ -527,6 +554,8 @@ def parallel_generate_graph_data():
 class XlGraphDataset(InMemoryDataset):
     def __init__(self, cfg, th, root=ROOT_DATA_DIR, transform=None, pre_transform=None, pre_filter=None):
         self.dataset_name = cfg['dataset']
+        if not os.path.isdir(f"{ROOT_DATA_DIR}{self.dataset_name}/"):
+            os.makedirs(f"{ROOT_DATA_DIR}{self.dataset_name}/")
         super().__init__(root, transform, pre_transform, pre_filter)
         self.data, self.slices = torch.load(self.processed_paths[0])
         self.get_labels(cfg, th)
@@ -539,7 +568,7 @@ class XlGraphDataset(InMemoryDataset):
 
     @property
     def processed_file_names(self):
-        return [self.dataset_name + '.pt']
+        return [f"{ROOT_DATA_DIR}{self.dataset_name}/{self.dataset_name}.pt"]
 
     @property
     def num_classes(self):
@@ -637,7 +666,10 @@ class XlGraphDataset(InMemoryDataset):
 class XlPairGraphDataset(XlGraphDataset):
     def __init__(self, cfg, th, root=ROOT_DATA_DIR, transform=None, pre_transform=None, pre_filter=None):
         super().__init__(cfg, th, root, transform, pre_transform, pre_filter)
-        self.data.linker_size = torch.reshape(self.data.linker_size, (self.data.linker_size.size()[0], 1))
+        if len(self.data.linker_size.size()) > 0:
+            self.data.linker_size = torch.reshape(self.data.linker_size, (self.data.linker_size.size()[0], 1))
+        else:
+            self.data.linker_size = torch.reshape(self.data.linker_size, (1, 1))
         self.remove_features(cfg)
 
     @property
@@ -646,7 +678,7 @@ class XlPairGraphDataset(XlGraphDataset):
 
     @property
     def processed_file_names(self):
-        return [self.dataset_name + '.pt']
+        return [f"{ROOT_DATA_DIR}{self.dataset_name}/{self.dataset_name}.pt"]
 
     def process(self):
         super(XlPairGraphDataset, self).process()
@@ -728,6 +760,9 @@ class XlPairGraphDataset(XlGraphDataset):
             if 'anchor' not in keep_features:
                 self.data.x_a[:, ANCHOR_DIST_IDX] = 0
                 self.data.x_b[:, ANCHOR_DIST_IDX] = 0
+            if 'anchor_cb' not in keep_features:
+                self.data.x_a[:, ANCHOR_CB_DIST_IDX] = 0
+                self.data.x_b[:, ANCHOR_CB_DIST_IDX] = 0
             if 'id' not in keep_features:
                 self.data.x_a[:, ID_ENCODING_START: ID_ENCODING_END] = 0
                 self.data.x_b[:, ID_ENCODING_START: ID_ENCODING_END] = 0
@@ -760,9 +795,9 @@ class XlPairGraphDataset(XlGraphDataset):
 
         self.data.linker_size = self.data.linker_size / max_linker
 
-        self.data.ca_error[self.data.ca_error == cross_link.INVALID_ERROR_VALUE] = cross_link.MEAN_PAE_ERROR
-        self.data.ca_error[self.data.ca_error < 1] = 1
-        self.data.ca_error = 1 / self.data.ca_error
+        # self.data.ca_error[self.data.ca_error == cross_link.INVALID_ERROR_VALUE] = cross_link.MEAN_PAE_ERROR
+        # self.data.ca_error[self.data.ca_error < 1] = 1
+        # self.data.ca_error = 1 / self.data.ca_error
 
     def compare_two_datasets(self, data_a, data_b):
         return torch.eq(data_a.x_a, data_b.x_a).all() and torch.eq(data_a.x_b, data_b.x_b).all() and \

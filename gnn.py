@@ -24,7 +24,8 @@ class GeneralGNN(torch.nn.Module):
                  sparse=True, structure_learn=True, lamb=1.0, cb_head=True, omega_head=True,
                  theta_head=True, phi_head=True, n_layers=3, angles='regression', ca_head=True,
                  loss_type='bce', gnn_type='gcn', act_func='relu', batchnorm=False, n_attn_heads=2,
-                 is_xl_type=False, is_spacer_size=True, pool_func='sum', is_ca_pool=False, attn_dropout=0.0):
+                 is_xl_type=False, is_spacer_size=True, pool_func='sum', is_ca_pool=False, attn_dropout=0.0,
+                 embed_edges=False, is_squeeze=False):
         super(GeneralGNN, self).__init__()
 
         self.is_ca = ca_head
@@ -40,6 +41,7 @@ class GeneralGNN(torch.nn.Module):
         self.is_ordinal = loss_type == 'ordinal'
         self.pool_func = layers.customPool(n_hidden, pool_ratio, sample, sparse, structure_learn, lamb, pool_func,
                                            is_ca_pool)
+        self.is_squeeze = is_squeeze
         if loss_type == 'corn':
             self.num_classes = out_size - 1
         else:
@@ -47,10 +49,10 @@ class GeneralGNN(torch.nn.Module):
 
         self.GNN_A, _ = GeneralGNN.get_wraped_gnn(n_feat, n_hidden, out_size, pool_ratio, dropout, sample, sparse,
                                                structure_learn, lamb, n_layers, gnn_type, self.act, batchnorm,
-                                                  n_attn_heads, self.pool_func, is_ca_pool, attn_dropout)
+                                                  n_attn_heads, self.pool_func, is_ca_pool, attn_dropout, embed_edges)
         self.GNN_B, x_dim = GeneralGNN.get_wraped_gnn(n_feat, n_hidden, out_size, pool_ratio, dropout, sample, sparse,
                                                structure_learn, lamb, n_layers, gnn_type, self.act, batchnorm,
-                                                      n_attn_heads, self.pool_func, is_ca_pool, attn_dropout)
+                                                      n_attn_heads, self.pool_func, is_ca_pool, attn_dropout, embed_edges)
         if pool_func == 'hgpsl':
             x_dim *= 2
         add_dims = 0
@@ -61,7 +63,12 @@ class GeneralGNN(torch.nn.Module):
         # self.lin1 = torch.nn.Linear(2 * x_dim + add_dims, self.nhid)
         self.lin1 = torch.nn.Linear(2 * x_dim, self.nhid)
         self.lin2 = torch.nn.Linear(self.nhid + add_dims, self.nhid // 2)
-        self.lin3 = torch.nn.Linear(self.nhid // 2, self.num_classes)
+
+        if self.is_squeeze:
+            self.squeeze_layer = torch.nn.Linear(self.nhid // 2, 1)
+            self.lin3 = torch.nn.Linear(1, self.num_classes)
+        else:
+            self.lin3 = torch.nn.Linear(self.nhid // 2, self.num_classes)
         if self.is_ordinal:
             self.sig = torch.nn.Sigmoid()
         if self.is_cb:
@@ -92,7 +99,8 @@ class GeneralGNN(torch.nn.Module):
     @staticmethod
     def get_wraped_gnn(n_feat, n_hidden=128, out_size=1, pool_ratio=0.8, dropout=0.0, sample=False,
                        sparse=True, structure_learn=True, lamb=1.0, n_layers=3, gnn_type='gcn', act=nn.ReLU(),
-                       batchnorm=False, n_attn_heads=2, pool_func=layers.customPool(), is_ca_pool=False, attn_dropout=0.0):
+                       batchnorm=False, n_attn_heads=2, pool_func=layers.customPool(), is_ca_pool=False,
+                       attn_dropout=0.0, embed_edges=False):
         x_dim = 0
         if gnn_type == 'gine':
             n = CustomGIN(n_feat, n_hidden, dropout, n_layers, act, True, batchnorm)
@@ -108,13 +116,14 @@ class GeneralGNN(torch.nn.Module):
                          structure_learn, lamb, include_linear=False, n_layers=n_layers)
             x_dim = n_hidden * 2 * n_layers
         elif gnn_type == 'gat':
-            n = CustomGAT(n_feat, n_hidden, dropout, n_layers, act, n_attn_heads, batchnorm, dropout, attn_dropout, pool_func)
+            n = CustomGAT(n_feat, n_hidden, dropout, n_layers, act, n_attn_heads, batchnorm, dropout, attn_dropout,
+                          pool_func, embed_edges)
             x_dim = n_hidden * n_layers
         if is_ca_pool:
             x_dim += (n_hidden * n_layers)
         return n, x_dim
 
-    def forward(self, data):
+    def forward(self, data, edge_index=None, ):
         ca_out, cb_out, omega_out, theta_out, phi_out = None, None, None, None, None
         x_a = self.GNN_A(None, data.x_a, data.edge_index_a, data.edge_attr_a, data.x_a_batch)
         x_b = self.GNN_B(None, data.x_b, data.edge_index_b, data.edge_attr_b, data.x_b_batch)
@@ -132,6 +141,8 @@ class GeneralGNN(torch.nn.Module):
         x = self.act(self.lin2(x))
         x = self.dropout(x)
         if self.is_ca:
+            if self.is_squeeze:
+                x = self.act(self.squeeze_layer(x))
             ca_out = self.lin3(x)
             if self.is_ordinal:
                 ca_out = self.sig(ca_out)
@@ -283,8 +294,8 @@ class HGPSLGNN(torch.nn.Module):
 
 
 class CustomGAT(torch.nn.Module):
-    def __init__(self, n_feat, n_hidden=128, dropout=0.0, n_layers=3, act=nn.ReLU(), n_heads=2, batchnorm=False,
-                 in_dropout=0.0, attn_dropout=0.0, pool_func=layers.customPool()):
+    def __init__(self, n_feat, n_hidden=128, dropout=0.0, n_layers=3, act=nn.PReLU(), n_heads=2, batchnorm=False,
+                 in_dropout=0.0, attn_dropout=0.0, pool_func=layers.customPool(), embed_edges=False):
         super(CustomGAT, self).__init__()
         self.nhid = n_hidden
         self.num_features = n_feat
@@ -299,6 +310,12 @@ class CustomGAT(torch.nn.Module):
         self.pool_func = pool_func
         self.pre_lin1 = torch.nn.Linear(self.num_features, self.nhid)
         self.pre_lin2 = torch.nn.Linear(self.nhid, self.nhid)
+        self.embed_edges = embed_edges
+        edge_dim = 1
+        if embed_edges:
+            edge_dim = self.nhid
+            self.edge_lin = torch.nn.Linear(1, self.nhid)
+
         if n_heads % self.nhid != 0:
             n_heads = 8
         # self.convs.append(GCNConv(self.nhid, self.nhid, add_self_loops=False, improved=True))
@@ -306,8 +323,9 @@ class CustomGAT(torch.nn.Module):
         #                             add_self_loops=False))
         # self.convs.append(GATv2Conv(self.nhid, self.nhid // n_heads, heads=n_heads, dropout=attn_dropout, edge_dim=1,
         #                             add_self_loops=False))
+
         for i in range(n_layers):
-            self.convs.append(GATv2Conv(self.nhid, self.nhid // n_heads, heads=n_heads, dropout=attn_dropout, edge_dim=1,
+            self.convs.append(GATv2Conv(self.nhid, self.nhid // n_heads, heads=n_heads, dropout=attn_dropout, edge_dim=edge_dim,
                                         add_self_loops=False))
             if batchnorm:
                 # self.norms.append(nn.BatchNorm1d(self.nhid))
@@ -324,6 +342,9 @@ class CustomGAT(torch.nn.Module):
 
         x = self.act(self.pre_lin1(x))
         x = self.input_dropout(self.act(self.pre_lin2(x)))
+        if self.embed_edges:
+            edge_attr = self.act(self.edge_lin(torch.reshape(edge_attr, (len(edge_attr), 1))))
+
         x_i = []
         for i in range(self.n_layers):
             x = self.convs[i](x, edge_index, edge_attr)
@@ -570,4 +591,5 @@ def create_model(cfg):
                       loss_type=cfg['loss_type'], gnn_type=cfg['gnn_type'], act_func=cfg['activation'],
                       batchnorm=cfg['batchnorm'], n_attn_heads=cfg['attention_heads'], is_xl_type=cfg['xl_type_feature'],
                       is_spacer_size=cfg['spacer_feture'], pool_func=cfg['global_pool_func'],
-                      is_ca_pool=cfg['is_ca_pool'], attn_dropout=cfg['attn_dropout'])
+                      is_ca_pool=cfg['is_ca_pool'], attn_dropout=cfg['attn_dropout'], embed_edges=cfg['embed_edges'],
+                      is_squeeze=cfg['squeeze_layer'])

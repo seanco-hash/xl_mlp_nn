@@ -1,9 +1,11 @@
 import argparse
-import subprocess
+import multiprocessing
 import sys
 import os
+import shutil
 import torch
-import numpy as np
+import traceback
+import seaborn as sns
 import random
 from Bio.PDB.PDBParser import PDBParser
 from Bio.PDB.MMCIFParser import MMCIFParser
@@ -13,12 +15,245 @@ import compare_xl_restraints
 sys.path.insert(0, '/cs/labs/dina/seanco/xl_parser')
 import pdb_files_manager
 import cross_link
+import general_utils
 import train
 import graph_dataset
 import data_proccess
+import numpy as np
+import copy
+import matplotlib.pyplot as plt
 
 
-device = train.device
+# device = train.device
+device = 'cpu'
+
+
+def plot_ablation_heatmaps(data):
+    idx_to_aa_dict = {v: k for k, v in pdb_files_manager.AA_TABLE_IDX.items()}
+    ysticks = [idx_to_aa_dict[i] for i in range(20)]
+    for i in range(data.shape[0]):
+        ax = sns.heatmap(data[i], linewidth=0.5, vmin=np.min(data), vmax=np.max(data), yticklabels=ysticks)
+        plt.title(f"Prediction Changes Replacing {idx_to_aa_dict[i]}")
+        plt.show()
+
+
+def clear_empty_files():
+    base_dir = '/cs/labs/dina/seanco/xl_parser/scwrl/'
+    dirs = ['pred_changes/', 'label_changes/', 'counters/']
+    to_remove = []
+    for d in dirs:
+        cur_dir = base_dir + d
+        for f in os.listdir(cur_dir):
+            np_arr = np.load(cur_dir + f)
+            if not np_arr.any():
+                to_remove.append(cur_dir + f)
+    for f in to_remove:
+        os.unlink(f)
+
+
+def read_ablation_results():
+    base_dir = '/cs/labs/dina/seanco/xl_parser/scwrl/'
+    dirs = ['pred_changes/', 'label_changes/', 'counters/']
+    total_pred_probs = np.zeros((len(pdb_files_manager.EXTENDED_AA_LETTERS), len(pdb_files_manager.AA_LETTERS), 4))
+    total_pred_labels = np.zeros((len(pdb_files_manager.EXTENDED_AA_LETTERS), len(pdb_files_manager.AA_LETTERS), 4))
+    total_num_samples = np.zeros((len(pdb_files_manager.EXTENDED_AA_LETTERS), len(pdb_files_manager.AA_LETTERS)))
+    for f in os.listdir(base_dir + dirs[0]):
+        total_pred_probs += np.load(base_dir + dirs[0] + f)
+        if os.path.isfile(base_dir + dirs[1] + f):
+            total_pred_labels += np.load(base_dir + dirs[1] + f)
+        total_num_samples += np.load(base_dir + dirs[2] + f)
+    total_pred_probs /= np.reshape(total_num_samples, (total_num_samples.shape[0], total_num_samples.shape[1], 1))
+    total_pred_probs[np.isnan(total_pred_probs)] = 0
+    plot_ablation_heatmaps(total_pred_probs)
+
+
+def get_pdb_file_list_of_object(obj):
+    if obj.pdb_path[-3:] == 'pdb':
+        pdb_file = [obj.pdb_path]
+    else:
+        pref, suff = obj.pdb_path.split('.')
+        pdb_file = [f"{pref}_{obj.chain_a}.{suff}"]
+        if obj.chain_a != obj.chain_b:
+            pdb_file += [f"{pref}_{obj.chain_b}.{suff}"]
+    return pdb_file
+
+
+def extract_features_single_object(out_dir, pdb_files, pdb_name, obj,
+                                   xl_dir=pdb_files_manager.INTER_AND_INTRA_LYS_XL_FILES_PATH):
+    xl_file = xl_dir + pdb_name + '.txt'
+    xl_feat_path = f"{out_dir}features/"
+    if not os.path.isdir(xl_feat_path):
+        os.makedirs(xl_feat_path)
+    pdb_files_manager.single_thread_extract_xl_features([xl_file], [pdb_files], output_path=xl_feat_path,
+                                                        predict=True)
+    feat_files = [xl_feat_path + pdb.split('/')[-1].split('.')[0] + '.txt' for pdb in pdb_files]
+    feat_dict = dict()
+    dict_keys = [pdb_name, pdb_name] if obj.pdb_path[-3:] == 'pdb' else [f"{pdb_name}_{obj.chain_a}", f"{pdb_name}_{obj.chain_b}"]
+    pdb_files_manager.predict_read_features(pdb_files, feat_dict, feat_files, keys=dict_keys)
+    return feat_dict
+
+
+def predict_single_object(obj, cfg, model, out_dir, pdb_files, pdb_name, old_aa=None, new_aa=None, cur_chain=None):
+    feat_dict = extract_features_single_object(out_dir, pdb_files, pdb_name, obj)
+    if old_aa is None:
+        dataset_name = f"{obj.pdb_path.split('.')[0].split('/')[-1]}_{obj.chain_a}_{obj.res_num_a}_{obj.chain_b}_{obj.res_num_b}"
+    else:
+        dataset_name = f"{obj.pdb_path.split('.')[0].split('/')[-1]}_{cur_chain}_{obj.res_num_a}_{old_aa}_{new_aa}"
+    graph_dataset.generate_graph_data([obj], feat_dict, None, None, dataset_name, None, edge_dist_th=3,
+                                      predict=False)
+    cfg['dataset'] = dataset_name
+    labels, probas = predict(cfg, [obj], False, None, None, model, False)
+    dataset_dir = graph_dataset.ROOT_DATA_DIR + dataset_name
+    shutil.rmtree(dataset_dir + '/', ignore_errors=True)
+    if os.path.isfile(dataset_dir + '.pkl'):
+        os.unlink(dataset_dir + '.pkl')
+    return labels, probas
+
+
+def ablation_study_create_mutation_files(xl_objects = None):
+    if xl_objects is None:
+        xl_objects = general_utils.load_obj('ablation_objects')
+        xl_objects = sorted(xl_objects, key=lambda o: o.pdb_path)
+    prev_pdb = ''
+    pdb_parser = PDBParser(PERMISSIVE=1)
+    closest_dict = general_utils.load_obj('closest_residues')
+    for i, obj in enumerate(xl_objects):
+        if obj.pdb_path != prev_pdb:
+            seq_dict = {}
+            if obj.pdb_path[-3:] == 'cif':
+                continue
+            else:
+                structure = pdb_parser.get_structure(obj.pdb_path.split('/')[-1], obj.pdb_path)
+            chains = list(structure.get_chains())
+        seq_a, seq_b = pdb_files_manager.get_sequences_for_obj(obj, chains, seq_dict)
+        pref, suff = obj.pdb_path.split('.')
+        closest_a = closest_dict[obj.pdb_path][obj.chain_a][obj.res_num_a]
+        pdb_a = obj.pdb_path if len(chains) == 1 else f"{pref}_{obj.chain_a}.{suff}"
+        pdb_files_manager.create_scwrl_mutation_files(obj.res_num_a, obj.chain_a, closest_a, pdb_a,
+                                                      copy.deepcopy(seq_a), pdb_files_manager.SCWRL_OUT_DIR)
+        closest_b = closest_dict[obj.pdb_path][obj.chain_b][obj.res_num_b]
+        pdb_b = pdb_a if obj.chain_a == obj.chain_b else f"{pref}_{obj.chain_b}.{suff}"
+        pdb_files_manager.create_scwrl_mutation_files(obj.res_num_b, obj.chain_b, closest_b, pdb_b,
+                                                      copy.deepcopy(seq_b),
+                                                      pdb_files_manager.SCWRL_OUT_DIR)
+        prev_pdb = obj.pdb_path
+
+
+def remove_dirs_and_files(dir_path):
+    folder = dir_path
+    for filename in os.listdir(folder):
+        file_path = os.path.join(folder, filename)
+        try:
+            if os.path.isfile(file_path) or os.path.islink(file_path):
+                os.unlink(file_path)
+            elif os.path.isdir(file_path):
+                shutil.rmtree(file_path, ignore_errors=True)
+        except Exception as e:
+            print('Failed to delete %s. Reason: %s' % (file_path, e))
+
+
+def ablation_study_objects_with_same_pdb(xl_objects, cfg, pid=None, scwrl_dir=pdb_files_manager.SCWRL_OUT_DIR):
+    print(f"start ablation process: {pid}")
+    print(sys.__stdout__)
+    print(sys.__stdout__.fileno())
+    closest_dict = general_utils.load_obj('closest_residues')
+    ablation_study_create_mutation_files(xl_objects)
+    model = train.get_model(cfg)
+    _optimizer = train.construct_optimizer(model.parameters(), cfg)
+    model, _ = train.load_model(cfg, model, _optimizer, is_cpu=True)
+    model.to(device)
+    model.eval()
+    pdb_name = xl_objects[0].pdb_path.split('/')[-1].split('.')[0]
+    out_dir = f"{scwrl_dir}{pdb_name}/"
+    pred_changes = np.zeros((len(pdb_files_manager.EXTENDED_AA_LETTERS), len(pdb_files_manager.AA_LETTERS), cfg['num_classes']))
+    label_changes = np.zeros((len(pdb_files_manager.EXTENDED_AA_LETTERS), len(pdb_files_manager.AA_LETTERS), cfg['num_classes']))
+    count_samples = np.zeros((len(pdb_files_manager.EXTENDED_AA_LETTERS), len(pdb_files_manager.AA_LETTERS)))
+    for obj in xl_objects:
+        try:
+            pdb_files = get_pdb_file_list_of_object(obj)
+            orig_labels, orig_probas = predict_single_object(obj, cfg, model, out_dir, pdb_files, pdb_name)
+            for r, (chain, res_num) in enumerate([(obj.chain_a, obj.res_num_a), (obj.chain_b, obj.res_num_b)]):
+                closest = closest_dict[obj.pdb_path][chain][res_num]
+                new_out_dir = f"{scwrl_dir}{pdb_name}/{chain}/{res_num}/"
+                for i, c in enumerate(closest):
+                    old_aa = c[1]
+                    old_aa_table_idx = pdb_files_manager.AA_TABLE_IDX[old_aa]
+                    for j, aa in enumerate(pdb_files_manager.AA_LETTERS):
+                        if aa != old_aa:
+                            new_pdb = new_out_dir + str(c[0]) + '_' + old_aa + '_' + aa + '.pdb'
+                            if os.path.isfile(new_pdb):
+                                new_pdb_files = copy.deepcopy(pdb_files)
+                                if len(new_pdb_files) > 1:
+                                    new_pdb_files[r] = new_pdb
+                                else:
+                                    new_pdb_files[0] = new_pdb
+                                labels, probas = predict_single_object(obj, cfg, model, out_dir, new_pdb_files, pdb_name, old_aa, aa, chain)
+                                pred_changes[old_aa_table_idx, j] += (probas[0] - orig_probas[0])
+                                label_changes[old_aa_table_idx, j, int(orig_labels[0])] -= 1
+                                label_changes[old_aa_table_idx, j, int(labels[0])] += 1
+                                count_samples[old_aa_table_idx, j] += 1
+        except Exception as e:
+            print(traceback.format_exc())
+            print(e)
+            print(f"problem with obj: {obj.pdb_path}")
+    if pid is not None and pred_changes.any():
+        print(f"saving {pid}")
+        np.save(f"{scwrl_dir}pred_changes/{pid}.npy", pred_changes)
+        np.save(f"{scwrl_dir}label_changes/{pid}.npy", label_changes)
+        np.save(f"{scwrl_dir}counters/{pid}.npy", count_samples)
+    else:
+        print(f"not saving {pid}")
+        return pred_changes, label_changes, count_samples
+    remove_dirs_and_files(out_dir)
+
+
+def run_ablation_single_process(object_lists, cfg):
+    pred_changes = np.zeros((len(pdb_files_manager.EXTENDED_AA_LETTERS), len(pdb_files_manager.AA_LETTERS), cfg['num_classes']))
+    label_changes = np.zeros((len(pdb_files_manager.EXTENDED_AA_LETTERS), len(pdb_files_manager.AA_LETTERS), cfg['num_classes']))
+    total_num_damples = 0
+    for lst in object_lists:
+        p, l, c = ablation_study_objects_with_same_pdb(lst, cfg, 1)
+        pred_changes += p
+        label_changes += l
+        total_num_damples += c
+    pred_changes = pred_changes / total_num_damples
+    label_changes = label_changes / total_num_damples
+    general_utils.save_obj(pred_changes, "ablation_pred_changes")
+    general_utils.save_obj(label_changes, "ablation_label_changes")
+
+
+def run_ablation_multi_process(object_lists, cfg):
+    processes = []
+    available_cpus = len(os.sched_getaffinity(0)) - 1
+    print(f"start run parallel. available cpus: {available_cpus}")
+    for pid in range(available_cpus):
+        objects = copy.deepcopy(object_lists[pid])
+        p = multiprocessing.Process(target=ablation_study_objects_with_same_pdb,
+                                args=(objects, copy.deepcopy(cfg), pid))
+        processes.append(p)
+        p.start()
+    for p in processes:
+        p.join()
+
+
+def ablation_study(cfg_path="/cs/labs/dina/seanco/xl_mlp_nn/configs/gnn_47f.yaml", run_parallel=True):
+    cfg = train.load_config(None, cfg_path)
+    xl_objects = general_utils.load_obj('ablation_objects')
+    xl_objects = sorted(xl_objects, key=lambda o: o.pdb_path)
+    i = 0
+    object_lists = []
+    while i < len(xl_objects):
+        prev_pdb = xl_objects[i].pdb_path
+        same_pdb_objects = []
+        while i < len(xl_objects) and prev_pdb == xl_objects[i].pdb_path:
+            same_pdb_objects.append(xl_objects[i])
+            i += 1
+        object_lists.append(same_pdb_objects)
+    print("before run parallel")
+    if run_parallel:
+        run_ablation_multi_process(object_lists, cfg)
+    else:
+        run_ablation_single_process(object_lists, cfg)
 
 
 def update_xlink_file_to_dimeric(in_file, out_file, chain_dimer_dict):
@@ -166,12 +401,13 @@ def fake_predict(cfg, data_name, xl_objects=None, best_prob=0.8, rand_prob=0.1, 
     return xl_objects, labels, pred_probs
 
 
-def predict(cfg, xl_objects, validate=True, out_file=None, dimer_dict=None):
-    model = train.get_model(cfg)
-    _optimizer = train.construct_optimizer(model.parameters(), cfg)
-    model, _ = train.load_model(cfg, model, _optimizer)
-    model.to(device)
-    model.eval()
+def predict(cfg, xl_objects, validate=True, out_file=None, dimer_dict=None, model=None, to_print=True):
+    if model is None:
+        model = train.get_model(cfg)
+        _optimizer = train.construct_optimizer(model.parameters(), cfg)
+        model, _ = train.load_model(cfg, model, _optimizer)
+        model.to(device)
+        model.eval()
     _, dataset = train.get_dataset(cfg)
     data_loader, _ = train.load_data(cfg, dataset, None, shuffle=False)
     probas = np.zeros((len(xl_objects), cfg['num_classes']))
@@ -184,8 +420,9 @@ def predict(cfg, xl_objects, validate=True, out_file=None, dimer_dict=None):
             _, y_pred_tags = torch.max(y_pred_prob, dim=1)
             labels[i] = (y_pred_tags.item())
             probas[i] = y_pred_prob.cpu().numpy()
-            print_prediction(xl_objects[i], y_pred_tags.item(), cfg, y_pred_prob.cpu().tolist()[0],
-                             validate, out_file, dimer_dict)
+            if to_print:
+                print_prediction(xl_objects[i], y_pred_tags.item(), cfg, y_pred_prob.cpu().tolist()[0],
+                                 validate, out_file, dimer_dict)
         return labels, probas
 
 
@@ -493,15 +730,60 @@ def run_prediction(cfg_path, out_path, xl_file, pdb_files, linker, multichain, s
 def main():
     # subprocess.Popen("module load cuda/11.3", shell=True, stdout=subprocess.PIPE)
     # subprocess.Popen("module load cudnn/8.2.1", shell=True, stdout=subprocess.PIPE)
-    _args = parse_args()
-    th_path, pred_xl_res_file = run_prediction(_args.cfg, _args.out_path, _args.xl, _args.pdb, _args.linker, _args.multichain,
-                                               _args.solution_pdb, _args.original_xl, _args.chain_dimer_dict)
-    print(th_path)
-    print(pred_xl_res_file)
+    print("start predict")
+    # ablation_study()
+
+    # _args = parse_args()
+    # th_path, pred_xl_res_file = run_prediction(_args.cfg, _args.out_path, _args.xl, _args.pdb, _args.linker, _args.multichain,
+    #                                            _args.solution_pdb, _args.original_xl, _args.chain_dimer_dict)
+    # print(th_path)
+    # print(pred_xl_res_file)
+
     # compare_xl_restraints.compare_xl_restraints(aligned_pdb_a, aligned_pdb_b, pd_file, _args.xl, pred_xl_res_file,
     #                                             th_path, _args.out_path, name)
 
 
 if __name__ == "__main__":
-    main()
+    # main()
+    # clear_empty_files()
+    # read_ablation_results()
+    # exit(0)
+    print("start predict")
+    cfg_path = "/cs/labs/dina/seanco/xl_mlp_nn/configs/gnn_47f.yaml"
+    cfg = train.load_config(None, cfg_path)
+    xl_objects = general_utils.load_obj('ablation_objects')
+    xl_objects = sorted(xl_objects, key=lambda o: o.pdb_path)
+    i = 0
+    object_lists = []
+    while i < len(xl_objects):
+        prev_pdb = xl_objects[i].pdb_path
+        same_pdb_objects = []
+        while i < len(xl_objects) and prev_pdb == xl_objects[i].pdb_path:
+            same_pdb_objects.append(xl_objects[i])
+            i += 1
+        object_lists.append(same_pdb_objects)
+    print("before run parallel")
+    processes = []
+    available_cpus = len(os.sched_getaffinity(0)) - 1
+    print(f"start run parallel. available cpus: {available_cpus}")
+    j = 0
+    while j < len(object_lists):
+        pid = 0
+        while pid < available_cpus and j + pid < len(object_lists):
+            if not os.path.isfile(f"/cs/labs/dina/seanco/xl_parser/scwrl/pred_changes/{j+pid}.npy"):
+                objects = copy.deepcopy(object_lists[j + pid])  # run forward
+                # objects = copy.deepcopy(object_lists[-(j + pid)])  # run backward
+                tmp_cfg = copy.deepcopy(cfg)
+                p = multiprocessing.Process(target=ablation_study_objects_with_same_pdb,
+                                            args=(objects, tmp_cfg, j + pid))
+                # p = multiprocessing.Process(target=ablation_study_objects_with_same_pdb,
+                #                             args=(objects, tmp_cfg, len(object_lists) - (j + pid)))
+                # ablation_study_objects_with_same_pdb(objects, tmp_cfg, j + pid)
+                processes.append(p)
+                p.start()
+            pid += 1
+        for p in processes:
+            p.join()
+        processes = []
+        j += available_cpus
 
