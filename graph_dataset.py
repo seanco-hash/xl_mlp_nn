@@ -15,6 +15,8 @@ from torch_geometric.loader import DataLoader as PyG_DataLoader
 from torch.utils.data.sampler import Sampler
 from typing import Callable
 import pandas as pd
+from sklearn.manifold import TSNE
+import seaborn as sns
 sys.path.insert(0, '/cs/labs/dina/seanco/xl_parser')
 import cross_link
 import general_utils
@@ -32,6 +34,7 @@ SEPARATE_18F_DATASET = "separate_graphs_18f_1t_dataset"
 SEPARATE_39F_ANGLES_DATASET = "separate_graphs_39f_12t_dataset"
 AA_DICT = {0: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 6, 8: 7, 10: 8, 11: 9, 12: 10, 13: 11, 15: 12, 16: 13,
            17: 14, 18: 15, 19: 16, 21: 17, 22: 18, 23: 19, 24: 20, 14: 21, 20: 22}
+SS_DICT = {65: 1, 72: 0, 76: 2, 83: 1, 1: 3}
 Y_DISTANCES = 0
 Y_OMEGA = 1
 OMEGA_SIZE = 2
@@ -51,27 +54,31 @@ INTER_XL = torch.from_numpy(np.asarray([0, 1])).long
 # Feature indices:
 MOL2_TYPE_START = 0
 MOL2_TYPE_END = 15
-RADIUS_IDX = 17
 CHARGE_IDX = 15
 ASA_IDX = 16
+RADIUS_IDX = 17
 RESIDUE_TYPE_START = 18
 RESIDUE_TYPE_END = 41
-ANCHOR_DIST_IDX = 41
-ANCHOR_CB_DIST_IDX = 42
-ID_ENCODING_START = 43
-ID_ENCODING_END = 47
+SS_IDX_START = 41
+SS_IDX_END = 45
+ANCHOR_DIST_IDX = 45
+ANCHOR_CB_DIST_IDX = 46
+ID_ENCODING_START = 47
+ID_ENCODING_END = 51
 MAX_FEATURES = torch.tensor([ 1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,
-                        1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.1100,
-                        44.2074,  2.2650,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,
-                        1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,
-                        1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  0.0000,
-                        1.0000, 15.0000, 17.5540,  1.0000,  1.0000,  1.0000,  1.0000], dtype=torch.float64)
+                             1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.1100,
+                            44.2074,  2.2650,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,
+                             1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,
+                             1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  1.0000,  0.0000,
+                             1.0000,  1.0000,  1.0000,  1.0000,  1.0000, 15.0000, 17.5540,  1.0000,
+                             1.0000,  1.0000,  1.0000], dtype=torch.float64)
 MIN_FEATURES = torch.tensor([ 0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,
-                              0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000, -0.7200,
-                              0.0000,  1.4300,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,
-                              0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,
-                              0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,
-                              0.0000,  0.0000,  0.0000,  0.0500,  0.0722,  0.0411,  0.0315], dtype=torch.float64)
+                             0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000, -0.7200,
+                             0.0000,  1.4300,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,
+                             0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,
+                             0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,
+                             0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0500,
+                             0.0722,  0.0411,  0.0315], dtype=torch.float64)
 MAX_LINKER_FEATURE = torch.tensor(34.4000)
 
 # MOL2_TYPE {C2 = 0, C3 =1 , Car = 2, Ccat = 3, N2 = 4, N4 = 5, Nam = 6,
@@ -172,6 +179,73 @@ class TwoGraphsData(Data):
             return self.x_b.size(0)
         else:
             return super().__inc__(key, value, *args, **kwargs)
+
+
+def get_pandas_df_from_objects(xl_objects, feat_dict, inter_pdbs, cif_files):
+    problems = [0, 0, 0, 0, 0]
+    features = []
+    cols = ['MOL2_TYPE', 'CHARGE', 'ASA', 'RADIUS', 'RES_TYPE', 'XL_TYPE', 'LINKER_TYPE', 'DISTANCE']
+    feat_cols = ['MOL2_TYPE', 'CHARGE', 'ASA', 'RADIUS', 'RES_TYPE', 'XL_TYPE', 'DISTANCE']
+    for obj in xl_objects:
+        try:
+            uni_a, uni_b = pdb_files_manager.find_feature_dict_keys_from_xl_obj(obj, feat_dict, problems, cif_files,
+                                                                                inter_pdbs,
+                                                                                feat_by_pdb=True, predict=False)
+            if uni_a is None or uni_b is None or obj.res_num_a not in feat_dict[uni_a] or obj.res_num_b not in feat_dict[
+                uni_b]:
+                uni_a, uni_b = pdb_files_manager.find_feature_dict_keys_from_xl_obj(obj, feat_dict, problems, cif_files,
+                                                                                    inter_pdbs=None, feat_by_pdb=False,
+                                                                                    predict=False)
+            uniport_feat_dict_a = feat_dict[uni_a]
+            uniport_feat_dict_b = feat_dict[uni_b]
+            res_a_feat = np.stack(uniport_feat_dict_a[obj.res_num_a][:-1])
+            res_a_feat = np.sum(res_a_feat, axis=0)
+            res_a_feat = np.append(res_a_feat, [obj.xl_type, cross_link.LINKER_DICT[obj.linker_type], obj.distance])
+            res_b_feat = np.stack(uniport_feat_dict_b[obj.res_num_b][:-1])
+            res_b_feat = np.sum(res_b_feat, axis=0)
+            res_b_feat = np.append(res_b_feat, [obj.xl_type, cross_link.LINKER_DICT[obj.linker_type], obj.distance])
+            features.append(res_a_feat)
+            features.append(res_b_feat)
+        except Exception as e:
+            print(e)
+            continue
+    df = pd.DataFrame(data=features, columns=cols)
+    df.to_pickle(f"{general_utils.OBJ_DIR}sum_features_df.pkl")
+    return df, cols, feat_cols
+
+
+def visualize_dataset(xl_objects, feat_dict, inter_pdbs, cif_Files, df_from_pickle=True):
+    cols = ['MOL2_TYPE', 'CHARGE', 'ASA', 'RADIUS', 'RES_TYPE', 'XL_TYPE', 'LINKER_TYPE', 'DISTANCE']
+    feat_cols = ['MOL2_TYPE', 'CHARGE', 'ASA', 'RADIUS', 'RES_TYPE', 'XL_TYPE', 'DISTANCE']
+    if df_from_pickle:
+        df = pd.read_pickle(f"{general_utils.OBJ_DIR}mean_features_df.pkl")
+    else:
+        df, cols, feat_cols = get_pandas_df_from_objects(xl_objects, feat_dict, inter_pdbs, cif_Files)
+    features = df[feat_cols]
+    # features['DISTANCE'] //= 10
+    tsne = TSNE(n_components=2, random_state=0)
+    tsne_results = tsne.fit_transform(features)
+    print('t-SNE done!')
+
+    df['tsne-2d-one'] = tsne_results[:, 0]
+    df['tsne-2d-two'] = tsne_results[:, 1]
+
+    plt.figure(figsize=(16, 10))
+    sns.scatterplot(
+        x="tsne-2d-one", y="tsne-2d-two",
+        hue="LINKER_TYPE",
+        palette=sns.color_palette("hls", 10),
+        data=df,
+        legend="full",
+        alpha=0.3
+    )
+    plt.title("T-SNE of mean features colored by linker type")
+    plt.show()
+    # fig = px.scatter(
+    #     projections, x=0, y=1,
+    #     color=df.LINKER_TYPE, labels={'color': 'LINKER_TYPE'}
+    # )
+    # fig.show()
 
 
 def analyze_res_type(data, n_classes=4):
@@ -388,14 +462,35 @@ def add_id_encoding(features, edge_index, k_hop=4):
     return features
 
 
-def res_type_to_onehot(features):
+def ss_to_one_hot(features, omit=True):
+    if omit:
+        return features[:, :-1]
+    if len(features[0]) == 5:
+        features = torch.cat((features, torch.ones((len(features), 1))), dim=1)
+    input_ = features[:, -1].to(torch.long)
+    try:
+        input_.apply_(SS_DICT.get)
+        one = F.one_hot(input_, num_classes=4)
+        features = torch.cat((features[:, :-1], one), dim=1)
+        return features
+    except Exception as e:
+        print(e)
+        print(input_)
+        print(f"invalid SS")
+        return None
+
+
+def res_type_to_onehot(features, omit_ss=True, idx=-1):
     if features.size()[1] < 19:
         return None
-    input_ = features[:, -1].to(torch.long)
+    input_ = features[:, idx].to(torch.long)
     try:
         input_.apply_(AA_DICT.get)
         one = F.one_hot(input_, num_classes=23)
-        features = torch.cat((features[:, :-1], one), dim=1)
+        if not omit_ss:
+            features = torch.cat((features[:, :idx], one, features[:, idx + 1:]), dim=1)
+        else:
+            features = torch.cat((features[:, :idx], one), dim=1)
         return features
     except Exception as e:
         print(e)
@@ -420,7 +515,7 @@ def add_xl_type_feature(obj):
 
 
 def generate_single_xl_data(obj, feat_dict, cif_files, problems, edge_dist_th=5,  two_graphs_data=True,
-                            inter_pdbs=None, predict=False):
+                            inter_pdbs=None, predict=False, omit_ss=True, res_type_idx=-1):
     uni_a, uni_b = pdb_files_manager.find_feature_dict_keys_from_xl_obj(obj, feat_dict, problems, cif_files, inter_pdbs,
                                                                         feat_by_pdb=True, predict=predict)
     if uni_a is None or uni_b is None or obj.res_num_a not in feat_dict[uni_a] or obj.res_num_b not in feat_dict[uni_b]:
@@ -433,11 +528,13 @@ def generate_single_xl_data(obj, feat_dict, cif_files, problems, edge_dist_th=5,
     uniport_feat_dict_a = feat_dict[uni_a]
     uniport_feat_dict_b = feat_dict[uni_b]
     res_a_feat = torch.from_numpy(np.stack(uniport_feat_dict_a[obj.res_num_a][:-1]))  # -1 - last is distance
+    res_a_feat = ss_to_one_hot(res_a_feat, omit_ss)
     res_a_feat = mol2_type_to_onehot(res_a_feat)
-    res_a_feat = res_type_to_onehot(res_a_feat)
+    res_a_feat = res_type_to_onehot(res_a_feat, omit_ss, res_type_idx)
     res_b_feat = torch.from_numpy(np.stack(uniport_feat_dict_b[obj.res_num_b][:-1]))
+    res_b_feat = ss_to_one_hot(res_b_feat, omit_ss)
     res_b_feat = mol2_type_to_onehot(res_b_feat)
-    res_b_feat = res_type_to_onehot(res_b_feat)
+    res_b_feat = res_type_to_onehot(res_b_feat, omit_ss, res_type_idx)
     if res_a_feat is None or res_b_feat is None:
         print(f"Problem type 2 with:{obj.pdb_file} {obj.uniport_a}, residues: {obj.res_num_a}, {obj.res_num_b}")
         problems[2] += 1
@@ -485,7 +582,7 @@ def generate_single_xl_data(obj, feat_dict, cif_files, problems, edge_dist_th=5,
 
 def generate_graph_data(processed_xl_objects=None, feature_dict=None, pid=None, cif_files=None,
                         data_name=SEPARATE_39F_ANGLES_DATASET, pdb_path=None, edge_dist_th=3, inter_pdbs=None,
-                        save=True, data=None, predict=False):
+                        save=True, data=None, predict=False, omit_ss=True, res_type_idx=-1):
     if feature_dict is None:
         feature_dict = pdb_files_manager.get_xl_neighbors_dict()
         print(f"dict size: {len(feature_dict)}\n")
@@ -499,11 +596,16 @@ def generate_graph_data(processed_xl_objects=None, feature_dict=None, pid=None, 
     missing_samples = 0
     # processed_xl_objects = pdb_files_manager.filter_objects_from_list_by_pdb(processed_xl_objects, inter_pdbs)
     for i, xl_obj in enumerate(processed_xl_objects):
-        d = generate_single_xl_data(xl_obj, feature_dict, cif_files, problems, edge_dist_th, True, inter_pdbs, predict)
-        if d is not None:
-            data.append(d)
-        else:
-            missing_samples += 1
+        try:
+            d = generate_single_xl_data(xl_obj, feature_dict, cif_files, problems, edge_dist_th, True, inter_pdbs, predict, omit_ss=omit_ss, res_type_idx=res_type_idx)
+            if d is not None:
+                data.append(d)
+            else:
+                missing_samples += 1
+            if i % 1000 == 0:
+                print(i)
+        except Exception as e:
+            print(e)
     print(f"num of data: {len(data)}, missing samples: {missing_samples}\n")
     print(problems)
     if save:
@@ -769,6 +871,9 @@ class XlPairGraphDataset(XlGraphDataset):
             if 'edges' not in keep_features:
                 self.data.edge_attr_a[:] = 1
                 self.data.edge_attr_b[:] = 1
+            if 'ss' not in keep_features:
+                self.data.x_a[:, SS_IDX_START: SS_IDX_END] = 0
+                self.data.x_b[:, SS_IDX_START: SS_IDX_END] = 0
 
     def min_max_scaling_normalization(self, cfg=None):
         x = torch.cat((self.data.x_a, self.data.x_b), dim=0)
@@ -821,25 +926,3 @@ class XlPairGraphDataset(XlGraphDataset):
     def get_ca_labels(dataset):
         idx = dataset.indices
         return dataset.dataset.data.y_ca[idx]
-
-#
-# if __name__ == "__main__":
-#     xl_objects = cross_link.get_upd_and_filter_processed_objects_pipeline()
-#     generate_graph_data(xl_objects, data_name='44f_3A_inter_lys_and_intra_dataset.pkl', edge_dist_th=3)
-#
-# data_list = general_utils.load_obj(SEPARATE_39F_ANGLES_DATASET, ROOT_DATA_DIR)
-# x = 7
-# data_list = XlGraphDataset.clear_duplicates(data_list)
-# generate_graph_data()
-# parallel_generate_graph_data()
-# unit_data_pickle_files()
-# xl_objects = cross_link.get_upd_and_filter_processed_objects_pipeline()
-# generate_graph_data(xl_objects, data_name='44f_3A_inter_lys_and_intra_dataset', edge_dist_th=3)
-# print("3:")
-# avg_degree_all_data(3)
-# print("4:")
-# avg_degree_all_data(4)
-# print("5:")
-# avg_degree_all_data(5)
-# print("6:")
-# avg_degree_all_data(6)

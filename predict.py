@@ -13,6 +13,7 @@ from Bio import PDB, SeqIO
 import scipy.stats as stats
 import compare_xl_restraints
 sys.path.insert(0, '/cs/labs/dina/seanco/xl_parser')
+import alpha_fold_files
 import pdb_files_manager
 import cross_link
 import general_utils
@@ -28,7 +29,49 @@ import matplotlib.pyplot as plt
 device = 'cpu'
 
 
-def plot_ablation_heatmaps(data):
+def count_increase_decrease(d):
+    tot = 0
+    if d[3] > 0:
+        tot += d[3]
+        if d[2] > 0:
+            tot += d[2]
+        elif d[3] + d[2] < 0:
+            tot += d[3] + d[2]
+        if d[1] > 0:
+            tot += d[1]
+        if d[0] > 0:
+            tot -= d[0]
+    else:
+        tot += d[3]
+        if d[2] < 0:
+            tot += d[2]
+        elif d[3] + d[2] > 0:
+            tot += d[3] + d[2]
+        if d[1] < 0:
+            tot += d[1]
+        if d[0] < 0:
+            tot -= d[0]
+    return tot
+
+
+
+def plot_total_ablation_heatmaps(data, title='', xlabel='', ylabel='', is_xticks=True):
+    # data = np.log(data)
+    general_utils.initialize_plt_params()
+    idx_to_aa_dict = {v: k for k, v in pdb_files_manager.AA_TABLE_IDX.items()}
+    ysticks = [idx_to_aa_dict[i] for i in range(len(data))]
+    if is_xticks:
+        xsticks = [idx_to_aa_dict[i] for i in range(len(data[0]))]
+    else:
+        xsticks = [i for i in range(len(data[0]))]
+    ax = sns.heatmap(data, linewidth=0.5, vmin=-0.1, vmax=0.1, yticklabels=ysticks, xticklabels=xsticks,
+                     cmap=sns.color_palette("vlag", as_cmap=True))
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.show()
+
+
+def plot_single_change_ablation_heatmaps(data):
     idx_to_aa_dict = {v: k for k, v in pdb_files_manager.AA_TABLE_IDX.items()}
     ysticks = [idx_to_aa_dict[i] for i in range(20)]
     for i in range(data.shape[0]):
@@ -62,9 +105,24 @@ def read_ablation_results():
         if os.path.isfile(base_dir + dirs[1] + f):
             total_pred_labels += np.load(base_dir + dirs[1] + f)
         total_num_samples += np.load(base_dir + dirs[2] + f)
+    # total_pred_labels[8] = 0
+    # total_pred_labels[:, 8] = 0
     total_pred_probs /= np.reshape(total_num_samples, (total_num_samples.shape[0], total_num_samples.shape[1], 1))
     total_pred_probs[np.isnan(total_pred_probs)] = 0
-    plot_ablation_heatmaps(total_pred_probs)
+    most_changed_from_aa = np.sum(total_pred_labels, axis=1)[:20]
+    most_changed_to_aa = np.sum(total_pred_labels, axis=0)
+    total_pred_labels /=  np.reshape(total_num_samples, (total_num_samples.shape[0], total_num_samples.shape[1], 1))
+    total_pred_labels[np.isnan(total_pred_labels)] = 0
+    inc_dec_change = np.apply_along_axis(count_increase_decrease, 2, total_pred_labels[:20, :])
+    plot_total_ablation_heatmaps(inc_dec_change, "", 'New AA', 'Original AA')
+    # plot_total_ablation_heatmaps(total_pred_labels[:20, :, 0], "", '', 'Original AA')
+    # plot_total_ablation_heatmaps(total_pred_labels[:20, :, 1], "", '', '')
+    # plot_total_ablation_heatmaps(total_pred_labels[:20, :, 2], "", 'New AA', 'Original AA')
+    # plot_total_ablation_heatmaps(total_pred_labels[:20, :, 3], "", 'New AA', '')
+    # plot_total_ablation_heatmaps(most_changed_from_aa, "Label Changes of Replacing specific AA to any other AA", 'Predicted Labels', 'Original AA')
+    # plot_total_ablation_heatmaps(most_changed_to_aa, "Label Changes of Replacing from any AA to specific AA", 'Predicted Labels', 'New AA')
+    # plot_single_change_ablation_heatmaps(total_pred_labels)
+    # plot_ablation_heatmaps(total_pred_probs)
 
 
 def get_pdb_file_list_of_object(obj):
@@ -566,12 +624,13 @@ def pre_process_data(xl_file, pdb_file, linker, solution_pdb, multichain):
     xl_feat_path = pdb_files_manager.XL_NEIGHBORS_FILES_PATH + 'predict/'
     if not os.path.isdir(xl_feat_path):
         os.makedirs(xl_feat_path)
+    pdb_files_manager.create_dssp_files_from_list(pdb_file)
     pdb_files_manager.single_thread_extract_xl_features([xl_file], [pdb_file], output_path=xl_feat_path, predict=True)
     xl_files_path = [xl_feat_path + pdb.split('/')[-1].split('.')[0] + '.txt' for pdb in pdb_file]
     feat_dict = dict()
     pdb_files_manager.predict_read_features(pdb_file, feat_dict, xl_files_path)
     update_feat_dict_by_dimers(feat_dict, dimer_dict)
-    graph_dataset.generate_graph_data(xl_objects, feat_dict, None, None, data_name, pdb_file, edge_dist_th=3, predict=True)
+    graph_dataset.generate_graph_data(xl_objects, feat_dict, None, None, data_name, pdb_file, edge_dist_th=3, predict=True, omit_ss=False, res_type_idx=-5)
     return data_name, xl_objects, dimer_dict
 
 
@@ -609,7 +668,7 @@ class TrainingParser(argparse.ArgumentParser):
             # default='None',
             # default='/cs/labs/dina/seanco/DockingXlScore/data/CASP13_target/xlinks.txt',
             # default='/cs/labs/dina/seanco/xl_mlp_nn/predictions/6jxd/pdb6jxd.txt',
-            default='/cs/labs/dina/seanco/xl_mlp_nn/predictions/6cp8/pdb6cp8.txt',
+            default='/cs/labs/dina/seanco/xl_mlp_nn/predictions/6jxd/pdb6jxd.txt',
             # default='/cs/labs/dina/seanco/Tric/xl/parsed_xl_32.txt',
             # default='/cs/labs/dina/seanco/xl_neighbors/xl_files/P75506.txt',
             type=str,
@@ -625,8 +684,8 @@ class TrainingParser(argparse.ArgumentParser):
         self.add_argument(
             "--chain_dimer_dict",
             help="pairs of dimeric chain id. for examle: AD BF CE ",
-            # default="AE BF CG DH",
-            default="",
+            default="AE BF CG DH",
+            # default="",
             type=str,
         )
         self.add_argument(
@@ -634,22 +693,14 @@ class TrainingParser(argparse.ArgumentParser):
             help="Path to pdb files",
             # default=['/cs/labs/dina/seanco/DockingXlScore/data/CASP13_target/A.pdb',
             #          '/cs/labs/dina/seanco/DockingXlScore/data/CASP13_target/B.pdb'],
-            default=['/cs/labs/dina/seanco/xl_mlp_nn/predictions/6cp8/A_tr.pdb',
-                     '/cs/labs/dina/seanco/xl_mlp_nn/predictions/6cp8/B_tr.pdb'],
-                     # '/cs/labs/dina/seanco/xl_mlp_nn/predictions/6jxd/C_tr.pdb',
-                     # '/cs/labs/dina/seanco/xl_mlp_nn/predictions/6jxd/D_tr.pdb',
-                     # '/cs/labs/dina/seanco/xl_mlp_nn/predictions/6jxd/E_tr.pdb',
-                     # '/cs/labs/dina/seanco/xl_mlp_nn/predictions/6jxd/F_tr.pdb',
-                     # '/cs/labs/dina/seanco/xl_mlp_nn/predictions/6jxd/G_tr.pdb',
-                     # '/cs/labs/dina/seanco/xl_mlp_nn/predictions/6jxd/H_tr.pdb',
-                     # '/cs/labs/dina/seanco/xl_mlp_nn/predictions/6jxd/I_tr.pdb',
-                     # '/cs/labs/dina/seanco/xl_mlp_nn/predictions/6jxd/J_tr.pdb'],
-                     # '/cs/labs/dina/seanco/xl_parser/pdbs/pdb6jxd_C.ent',
-                     # '/cs/labs/dina/seanco/xl_parser/pdbs/pdb6jxd_D.ent',
-                     # '/cs/labs/dina/seanco/xl_parser/pdbs/pdb6jxd_E.ent',
-                     # '/cs/labs/dina/seanco/xl_parser/pdbs/pdb6jxd_F.ent',
-                     # '/cs/labs/dina/seanco/xl_parser/pdbs/pdb6jxd_G.ent',
-                     # '/cs/labs/dina/seanco/xl_parser/pdbs/pdb6jxd_H.ent'],
+            default=['/cs/labs/dina/seanco/xl_mlp_nn/predictions/6jxd/A_tr.pdb',
+                     '/cs/labs/dina/seanco/xl_mlp_nn/predictions/6jxd/B_tr.pdb',
+                     '/cs/labs/dina/seanco/xl_mlp_nn/predictions/6jxd/C_tr.pdb',
+                     '/cs/labs/dina/seanco/xl_mlp_nn/predictions/6jxd/D_tr.pdb',
+                     '/cs/labs/dina/seanco/xl_mlp_nn/predictions/6jxd/E_tr.pdb',
+                     '/cs/labs/dina/seanco/xl_mlp_nn/predictions/6jxd/F_tr.pdb',
+                     '/cs/labs/dina/seanco/xl_mlp_nn/predictions/6jxd/G_tr.pdb',
+                     '/cs/labs/dina/seanco/xl_mlp_nn/predictions/6jxd/H_tr.pdb',],
             # default='/cs/labs/dina/seanco/xl_parser/pdbs/alpha_fold/pdb_files/P75506.pdb',
             nargs='+'
         )
@@ -657,7 +708,7 @@ class TrainingParser(argparse.ArgumentParser):
         self.add_argument(
             "--solution_pdb",
             help="(optional) Path to solution pdb of multichain protein",
-            default='/cs/labs/dina/seanco/xl_parser/pdbs/pdb6cp8_AB.ent',
+            default='/cs/labs/dina/seanco/xl_parser/pdbs/pdb6jxd.ent',
             # default='/cs/labs/dina/seanco/DockingXlScore/data/CASP13_target/A_B.pdb',
             # default='/cs/labs/dina/seanco/Tric/tric_align/debug_res.pdb',
             type=str
@@ -666,7 +717,7 @@ class TrainingParser(argparse.ArgumentParser):
         self.add_argument(
             "--out_path",
             help="Path to prediction output file",
-            default='/cs/labs/dina/seanco/xl_mlp_nn/predictions/6cp8/',
+            default='/cs/labs/dina/seanco/xl_mlp_nn/predictions/6jxd/',
             # default='/cs/labs/dina/seanco/DockingXlScore/data/CASP13_target/fake_prediction.txt',
             # default='/cs/labs/dina/seanco/Tric/input/fake_prediction.txt',
             type=str
@@ -675,8 +726,8 @@ class TrainingParser(argparse.ArgumentParser):
         self.add_argument(
             "--linker",
             help="Linker type. one of: DSSO, DSS, BDP_NHP UNKNOWN LEIKER",
-            # default='BDP-NHP',
-            default='DSSO',
+            default='BDP-NHP',
+            # default='DSSO',
             type=str
         )
 
@@ -728,62 +779,17 @@ def run_prediction(cfg_path, out_path, xl_file, pdb_files, linker, multichain, s
 
 
 def main():
-    # subprocess.Popen("module load cuda/11.3", shell=True, stdout=subprocess.PIPE)
-    # subprocess.Popen("module load cudnn/8.2.1", shell=True, stdout=subprocess.PIPE)
     print("start predict")
-    # ablation_study()
-
-    # _args = parse_args()
-    # th_path, pred_xl_res_file = run_prediction(_args.cfg, _args.out_path, _args.xl, _args.pdb, _args.linker, _args.multichain,
-    #                                            _args.solution_pdb, _args.original_xl, _args.chain_dimer_dict)
-    # print(th_path)
-    # print(pred_xl_res_file)
-
+    _args = parse_args()
+    th_path, pred_xl_res_file = run_prediction(_args.cfg, _args.out_path, _args.xl, _args.pdb, _args.linker, _args.multichain,
+                                               _args.solution_pdb, _args.original_xl, _args.chain_dimer_dict)
+    print(th_path)
+    print(pred_xl_res_file)
     # compare_xl_restraints.compare_xl_restraints(aligned_pdb_a, aligned_pdb_b, pd_file, _args.xl, pred_xl_res_file,
     #                                             th_path, _args.out_path, name)
 
 
 if __name__ == "__main__":
-    # main()
-    # clear_empty_files()
-    # read_ablation_results()
-    # exit(0)
-    print("start predict")
-    cfg_path = "/cs/labs/dina/seanco/xl_mlp_nn/configs/gnn_47f.yaml"
-    cfg = train.load_config(None, cfg_path)
-    xl_objects = general_utils.load_obj('ablation_objects')
-    xl_objects = sorted(xl_objects, key=lambda o: o.pdb_path)
-    i = 0
-    object_lists = []
-    while i < len(xl_objects):
-        prev_pdb = xl_objects[i].pdb_path
-        same_pdb_objects = []
-        while i < len(xl_objects) and prev_pdb == xl_objects[i].pdb_path:
-            same_pdb_objects.append(xl_objects[i])
-            i += 1
-        object_lists.append(same_pdb_objects)
-    print("before run parallel")
-    processes = []
-    available_cpus = len(os.sched_getaffinity(0)) - 1
-    print(f"start run parallel. available cpus: {available_cpus}")
-    j = 0
-    while j < len(object_lists):
-        pid = 0
-        while pid < available_cpus and j + pid < len(object_lists):
-            if not os.path.isfile(f"/cs/labs/dina/seanco/xl_parser/scwrl/pred_changes/{j+pid}.npy"):
-                objects = copy.deepcopy(object_lists[j + pid])  # run forward
-                # objects = copy.deepcopy(object_lists[-(j + pid)])  # run backward
-                tmp_cfg = copy.deepcopy(cfg)
-                p = multiprocessing.Process(target=ablation_study_objects_with_same_pdb,
-                                            args=(objects, tmp_cfg, j + pid))
-                # p = multiprocessing.Process(target=ablation_study_objects_with_same_pdb,
-                #                             args=(objects, tmp_cfg, len(object_lists) - (j + pid)))
-                # ablation_study_objects_with_same_pdb(objects, tmp_cfg, j + pid)
-                processes.append(p)
-                p.start()
-            pid += 1
-        for p in processes:
-            p.join()
-        processes = []
-        j += available_cpus
+    main()
+
 

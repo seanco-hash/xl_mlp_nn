@@ -49,13 +49,19 @@ class EarlyStopper:
         self.counter = 0
         self.min_validation_loss = np.inf
         self.best_model = None
+        self.confusion_matrix = None
+        self.predicted_probs = None
+        self.true_labels = None
 
-    def early_stop(self, validation_loss, model):
+    def early_stop(self, validation_loss, model, confusion_matrix, predicted_probs, true_labels):
         if validation_loss < self.min_validation_loss:
             self.min_validation_loss = validation_loss
             self.counter = 0
             self.best_model = copy.deepcopy(model)
             self.best_model.to('cpu')
+            self.confusion_matrix = copy.deepcopy(confusion_matrix)
+            self.predicted_probs = copy.deepcopy(predicted_probs)
+            self.true_labels = copy.deepcopy(true_labels)
         elif validation_loss > (self.min_validation_loss + self.min_delta):
             self.counter += 1
             if self.counter >= self.patience:
@@ -668,7 +674,7 @@ def load_data(cfg, train_data, eval_data=None, shuffle=True):
         train_sampler = graph_dataset.ImbalancedDatasetSampler(dataset=train_data,
                                                                callback_get_label=graph_dataset.XlPairGraphDataset.get_ca_labels)
         shuffle = False
-    elif cfg['sample'] and train_data != eval_data and cfg['xl_type_feature']:
+    elif cfg['data_type'] == 'Train' and cfg['sample'] and train_data != eval_data and cfg['xl_type_feature']:
         inter_idx = (train_data.dataset.data.xl_type.T[0] == 0).nonzero(as_tuple=True)[0]
         train_inter_idx = list(set(inter_idx.tolist()).intersection(train_data.indices.tolist()))
         train_inter_idx = torch.tensor([(train_data.indices == i).nonzero(as_tuple=True)[0] for i in train_inter_idx])
@@ -728,7 +734,7 @@ def get_labels_th(cfg):
         elif n_classes == 4:
             # th = random.choice([[12, 18, 22], [11, 17, 20], [11, 16, 21], [10, 17, 23], [13, 19, 23]])
             # th = [11.98239517, 16.39906025, 22.83931446]
-            th = [12.05986881, 16.56343269, 23.54780769]
+            th = [12.153751850128174, 16.749011993408203, 24.08793830871582]
         elif n_classes == 5:
             th = [6, 9, 12, 15]
         elif n_classes == 6:
@@ -919,7 +925,7 @@ def log_results(cfg, wandb_, confusion_matrix, predicted_probabilities, true_lab
         wandb_.log({f"{title}recall": recall})
         wandb_.log({f"{title}precision": precision})
         wandb_.log({f"{title}auc": auc_roc})
-        fig = general_utils.plot_roc(true_labels, probas, "Class-Wise ROC Curves (Test Set)",
+        fig, auc_values = general_utils.plot_roc(true_labels, probas, "Class-Wise ROC Curves (Test Set)",
                                      cfg['num_classes'], class_names)
         out_probs_file = f"/cs/labs/dina/seanco/xl_mlp_nn/models/outputs/probas_{cfg['name'].split('-')[-1]}.npy"
         out_label_file = f"/cs/labs/dina/seanco/xl_mlp_nn/models/outputs/labels_{cfg['name'].split('-')[-1]}.npy"
@@ -929,8 +935,9 @@ def log_results(cfg, wandb_, confusion_matrix, predicted_probabilities, true_lab
             np.save(f, true_labels)
         if fig is not None:
             wandb_.log({f"{title}roc_plot_multiclass": fig})
+            wandb_.log({f"{title} average auc value": np.mean(auc_values)})
         # plot_cm(true_labels, probas, class_names=class_names)
-        general_utils.plot_single_prediction_distribution(probas, true_labels)
+        # general_utils.plot_single_prediction_distribution(probas, true_labels)
 
 
 def load_model(cfg, model, _optimizer, wandb_=None, is_cpu=False):
@@ -996,7 +1003,7 @@ def train(cfg=None, i=0, wandb_=None):
                                     is_regression, cfg['num_classes'], eval_accuracy,
                                     cfg['epochs'] - 1, cfg, early_stop=cfg['early_stopping'])
             if cfg['early_stopping']:
-                if early_stopper.early_stop(val_loss[-1], model):
+                if early_stopper.early_stop(val_loss[-1], model, confusion_matrix, predicted_probabilities, true_labels):
                     break
 
         except Exception as e:
@@ -1006,39 +1013,10 @@ def train(cfg=None, i=0, wandb_=None):
             print(e)
             raise e
 
-    # ex = Explainer(
-    #     model=model,
-    #     algorithm=GNNExplainer(epochs=100),
-    #     explanation_type='model',
-    #     node_mask_type='common_attributes',
-    #     edge_mask_type=None,
-    #     model_config=dict(
-    #         mode='multiclass_classification',
-    #         task_level='graph',
-    #         return_type='log_probs',
-    #     ),
-    # )
-    #
-    # node_index = None
-    # explanations = []
-    # datas = list(iter(train_loader))
-    # for i, d in enumerate(datas):
-    #     data = d.to(device)
-    #     # explanations.append(ex(data, data.edge_index_a, index=node_index, target=data.y_ca))
-    #     explanations.append(ex(data, data.edge_index_a, index=node_index))
-    #     # if i > 100:
-    #     #     break
-    # # print(f'Generated explanations in {explanation.available_explanations}')
-    # # if explanation.validate():
-    # path = 'model_feature_importance.png'
-    # Explanation.visualize_avg_feat_importance(explanations, path=path)
-    # print(f"Feature importance plot has been saved to '{path}'")
-
-        # path = 'subgraph.pdf'
-        # explanation.visualize_graph(path)
-        # print(f"Subgraph visualization plot has been saved to '{path}'")
-
     print("Finished Training")
+    if cfg['early_stopping']:
+        confusion_matrix, predicted_probabilities, true_labels, model = early_stopper.confusion_matrix, early_stopper.predicted_probs, early_stopper.true_labels, early_stopper.best_model
+        model.to(device)
     log_results(cfg, wandb_, confusion_matrix, predicted_probabilities, true_labels, i, out_size)
     if cfg['xl_type_feature'] or cfg['log_inter_perf']:
         stats_of_inter_xl_performance(model, eval_data, criterion, wandb_, cfg, i, out_size)
@@ -1051,10 +1029,7 @@ def train(cfg=None, i=0, wandb_=None):
             if cfg['name'] == 'sweep':
                 save_name = f"models/{wandb_.name}"
             print("saving model")
-            if cfg['early_stopping']:
-                model = early_stopper.best_model
-            else:
-                model.to('cpu')
+            model.to('cpu')
             torch.save({'epoch': epoch, 'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': _optimizer.state_dict(), 'loss': train_loss[-1]}, save_name)
     elif cfg['name'] != 'None' and cfg['data_type'] == 'test':
@@ -1091,9 +1066,10 @@ class TrainingParser(argparse.ArgumentParser):
             # default="/cs/labs/dina/seanco/xl_mlp_nn/configs/gnn_separate_44f_3a.yaml",
             # default="/cs/labs/dina/seanco/xl_mlp_nn/configs/eval_inter_44f_3a.yaml",
             # default="/cs/labs/dina/seanco/xl_mlp_nn/configs/debug_config.yaml",
-            default="/cs/labs/dina/seanco/xl_mlp_nn/configs/gnn_47f.yaml",
+            # default="/cs/labs/dina/seanco/xl_mlp_nn/configs/gnn_47f.yaml",
+            default="/cs/labs/dina/seanco/xl_mlp_nn/configs/gnn_51f.yaml",
             # default="/cs/labs/dina/seanco/xl_mlp_nn/configs/eval_gnn_by_name.yaml",
-            # default="/cs/labs/dina/seanco/xl_mlp_nn/configs/sweep_gat_44.yaml",
+            # default="/cs/labs/dina/seanco/xl_mlp_nn/configs/sweep_gat_51.yaml",
             type=str,
         )
         self.add_argument(
@@ -1152,10 +1128,6 @@ def run_with_sweeps(config):
 
 
 if __name__ == "__main__":
-    # processed_xl_objects = cross_link.get_upd_and_filter_processed_objects_pipeline()
-    # cross_link.CrossLink.create_closest_residues_dict(processed_xl_objects)
-    # cross_link.CrossLink.create_mutation_pdbs()
-    # exit(0)
     print("Start main\n", flush=True)
     seed_everything()
     args = parse_args()
